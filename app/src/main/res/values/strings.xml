@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">HomeNode</string>
+    <string name="bootstrap_status_title">HomeNode Bootstrap (Slice S0)</string>
+    <string name="bootstrap_status_subtitle">9-module architecture scaffold initialized for Galaxy S8+ (API 28 target stance, minSdk 26).</string>
+</resources>

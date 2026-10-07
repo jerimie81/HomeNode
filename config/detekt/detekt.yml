@@ -1,0 +1,33 @@
+# VERIFY: Confirm detekt version compatibility with your selected Kotlin compiler version in libs.versions.toml
+build:
+  maxIssues: 0
+  excludeCorrectable: false
+
+complexity:
+  LongMethod:
+    active: true
+    threshold: 60
+  LargeClass:
+    active: true
+    threshold: 400
+
+coroutines:
+  active: true
+  GlobalCoroutineUsage:
+    active: true
+  RedundantSuspendModifier:
+    active: true
+  SleepInsteadOfDelay:
+    active: true
+
+exceptions:
+  SwallowedException:
+    active: true
+  TooGenericExceptionCaught:
+    active: true
+
+potential-bugs:
+  ImplicitDefaultLocale:
+    active: true
+  UnsafeCast:
+    active: true

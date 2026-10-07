@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- §4: Exclude all key material, vault, and token stores from Auto Backup (API <= 30, including API 28 S8+) -->
+<full-backup-content>
+    <exclude domain="file" path="." />
+    <exclude domain="database" path="." />
+    <exclude domain="sharedpref" path="." />
+    <exclude domain="no_backup" path="." />
+</full-backup-content>

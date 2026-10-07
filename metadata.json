@@ -1,0 +1,6 @@
+{
+  "name": "HomeNode",
+  "description": "Private peer-to-peer home node for local, network, and cloud storage and allowlisted LAN services on Android 9 (API 28).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
