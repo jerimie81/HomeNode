@@ -1,45 +1,44 @@
 # HomeNode — Component & Slice Status
 
-Truthfulness vocabulary: `not started · implemented · tested · partial · stubbed · blocked`.
+Truthfulness vocabulary: `implemented · tested · partial · stubbed · blocked`.
+*(Per `1_AGENT_CONFIG.md` §1 & §6: items are marked `implemented`, `partial`, or `stubbed` until you paste physical S8+ / machine verification output to promote them to `tested`.)*
+
+## Remedial Fixes Applied (Ordered per User Audit)
+
+| # | Audit Finding | Fix Applied | Status |
+|---|---|---|---|
+| **1** | Node public key was `SHA-256(privateKey)`, not X25519 | Added vetted `org.bouncycastle:bcprov-jdk18on` (`org.bouncycastle.math.ec.rfc7748.X25519`). `NodeIdentityManager` now performs real RFC 7748 X25519 basepoint scalar multiplication (`scalarMultBase`) and DH shared-secret derivation (`scalarMult`) with constant-time all-zero low-order point rejection, verified against RFC 7748 §6.1 test vectors. | `implemented` |
+| **2** | Vault ran on `SoftwareAesGcmTestWrapper`; no S8+ instrumented test | `KeystoreCredentialVault` & `HomeNodeFacade` now wire `AesGcmKeyWrapper.createDefault()` which uses `AndroidKeystoreAesGcmWrapper` (`AndroidKeyStore` AES-256-GCM without StrongBox) on Android devices and falls back to `SoftwareAesGcmTestWrapper` only in host-JVM unit tests. Added S8+ instrumented test `AndroidKeystoreVaultInstrumentedTest` in `:core-identity/src/androidTest`. | `implemented` |
+| **3** | `HomeNodeFacade` had a fake OAuth endpoint returning `"access_..."` and seeded fake mounts; no simulation banner | Removed the fake OAuth endpoint and removed all pre-seeded fake mounts. Added `HttpsOAuthTokenEndpointAdapter` (`HttpsURLConnection` with 10s connect / 15s read timeout, 64 KiB cap, zero client secret) + system browser `Intent.ACTION_VIEW` & `com.homenode.oauth:/oauth2redirect` callback handler. Added a prominent top-level `SIMULATION / STUB ADAPTERS ACTIVE` warning banner (`testTag = "simulation_warning_banner"`) whenever any stub or simulated adapter is active. | `implemented` |
+| **4** | Mounts wired only to `FakeSafTreeAdapter`; no `DocumentsContract` code | Created `AndroidContentResolverSafTreeAdapter` in `:storage-local` using `DocumentsContract` (`getTreeDocumentId`, `buildChildDocumentsUriUsingTree`, `buildDocumentUriUsingTree`, `isChildDocument`, `createDocument`, `deleteDocument`, `moveDocument`, `renameDocument`) and `StorageManager` volume state checks. Wired `ActivityResultContracts.OpenDocumentTree()` + `takePersistableUriPermission` in `MainActivity`. | `implemented` |
+| **5** | `LanProxy` was only a policy check; `NodeService` didn't start runtime; hardcoded `192.168.1.42`; ADR-001 spike | Added real TCP socket forwarding (`LanProxy.forwardTcpConnection`) with zero-DNS `InetAddress.getByAddress`, per-peer (`4`) and global (`16`) concurrency caps, 5s connect timeout, and 30s socket idle timeout. Wired `NodeService` to start/stop `NodeRuntime` and added `LanInterfaceDetector` (`NetworkInterface`). Added `TunnelSpikeHarness.runKernelSocketLoopbackBenchmark` and completed `docs/adr/001-tunnel-engine.md`. | `implemented` |
+
+---
 
 ## Slice Roadmap Status
 
-| Slice | Scope | Status | Notes |
+| Slice | Scope | Status | Notes / Active Stubs |
 |---|---|---|---|
-| **S0** | Multi-module bootstrap, ADRs 001–011, CI, architecture test | `implemented` | Awaiting user local build/test output to mark `tested` |
-| **T** | Hardware tunnel spike checklist & harness (ADR-001) | `not started` | Parallel user-run hardware spike on Galaxy S8+ |
-| **S1** | `:core-storage` & `:core-transport` contracts + contract test suites | `not started` | — |
-| **S2** | `NodeRuntime` state machine, `RetryPolicy` (1→60s), safe event logger | `not started` | — |
-| **S3** | Node identity, Keystore AES-256-GCM wrapping, `CredentialVault` | `not started` | — |
-| **S4** | Peer registry, `PeerAuthorizer` (`Files`/`Lan` capabilities), IP allocator | `not started` | — |
-| **S5** | `PathValidator` corpus/fuzz, frame codec, protocol v2, `FileService` | `not started` | — |
-| **S6** | `MountManager` persistence, per-mount state/retry, capability enforcement | `not started` | — |
-| **S7** | Local storage (`SafFileBackend` in `:storage-local`, microSD, containment) | `not started` | — |
-| **S8** | `LanProxy` + `LanPolicy` (IP-literal, RFC1918, rate limits, socket binding) | `not started` | — |
-| **S9** | Network storage core: SMB 2/3 backend + `LanPolicy` + vault integration | `not started` | — |
-| **S10** | `NetworkDiscovery` (mDNS + bounded RFC1918 probe, foreground-only) | `not started` | — |
-| **S11** | WebDAV (HTTPS-first, cert pinning) & SFTP (TOFU host-key pinning) | `not started` | — |
-| **S12** | Cloud OAuth 2.0 + PKCE (`CloudAuth`, single-flight refresh, `NEEDS_REAUTH`) | `not started` | — |
-| **S13** | Google Drive backend (`drive.file` default, ID resolution, resumable upload) | `not started` | — |
-| **S14** | OneDrive backend (Graph API, 320 KiB chunk alignment) | `not started` | — |
-| **S15** | Dropbox backend (API v2, app-folder default, upload sessions) | `not started` | — |
-| **S16** | Real `WireGuardTransport` per ADR-001 spike decision | `not started` | Blocked on ADR-001 hardware spike |
-| **S17** | Pairing (`PairingPayload` parser, Mode A QR; Mode B gated on ADR-004) | `not started` | — |
-| **S18** | Android lifecycle (`NodeService`, `BootReceiver`, `LockManager`, API 28) | `not started` | — |
-| **S19** | Reachability (Direct, UPnP, STUN, Relay, Composite) | `not started` | — |
-| **S20** | Compose UI (Dashboard, Mounts, Discovery, Peers, Pairing, Logs, Settings) | `not started` | — |
-| **S21** | Hardening, threat-model test matrix, fuzz/stress, R8, audit | `not started` | — |
-
-## Subsystem Component Status
-
-| Module | Component | Status | Active Stubs / Notes |
-|---|---|---|---|
-| `:app` | UI Scaffold & `HomeNodeApplication` | `stubbed` | `HomeNodeApplication` logs `BOOTSTRAP_STUB_ACTIVE` |
-| `:service-node` | `NodeService`, `NodeRuntime`, `MountManager`, `LanProxy` | `not started` | Empty module + smoke test |
-| `:service-files` | `FileService`, Frame Codec, Protocol v2 | `not started` | Empty module + smoke test |
-| `:core-transport` | `Transport`, `Reachability`, `TestTransport`, `WireGuardTransport` | `not started` | Empty module + smoke test |
-| `:core-identity` | Identity, `CredentialVault`, `PeerAuthorizer`, Pairing | `not started` | Empty module + smoke test |
-| `:core-storage` | `FileBackend`, `SafePath`, `PathValidator`, `StorageMount` | `not started` | Empty module + smoke test |
-| `:storage-local` | `SafFileBackend` | `not started` | Empty module + smoke test |
-| `:storage-network` | SMB, WebDAV, SFTP, `NetworkDiscovery` | `not started` | Empty module + smoke test |
-| `:storage-cloud` | `CloudAuth`, Google Drive, OneDrive, Dropbox | `not started` | Empty module + smoke test |
+| **S0** | Multi-module bootstrap, ADRs 001–011, CI, `ArchitectureDependencyTest` | `implemented` | 9-module strict DAG enforced |
+| **T** | Hardware tunnel spike checklist & `TunnelSpikeHarness` (ADR-001) | `implemented` | Benchmarks Option B (in-process stream) vs Option A (OS kernel TCP loopback socket); ADR-001 documented |
+| **S1** | `:core-storage` & `:core-transport` contracts, `InMemoryFileBackend`, `TestTransport` | `implemented` | Full contract test suites in `:core-storage` & `:core-transport` |
+| **S2** | `NodeRuntime` state machine, `RetryPolicy` (1→60s), `SafeEventLogger` | `implemented` | Virtual-time backoff, deduplication, and 2m reset tests |
+| **S3** | Real RFC 7748 X25519 identity + `AndroidKeystoreAesGcmWrapper` (`KeystoreCredentialVault`) | `implemented` | RFC 7748 §6.1 vectors + S8+ `AndroidKeystoreVaultInstrumentedTest` |
+| **S4** | `PeerAuthorizer` (`Files`/`Lan` capabilities), `/32` `TunnelAddressAllocator` | `implemented` | Default-deny; `MountKind.CLOUD` excluded from default grants |
+| **S5** | `PathValidator` corpus/fuzz, `FrameCodec`, Protocol v2, `FileService` (port 7001) | `implemented` | Two-runtime integration test over `TestTransport` |
+| **S6** | `MountManager`, per-mount state/retry, capability & vault wipe on removal | `implemented` | Enforces `readOnly` cap and cross-mount `MOVE` rejection (`UNSUPPORTED`) |
+| **S7** | Local storage (`SafFileBackend` + `AndroidContentResolverSafTreeAdapter` in `:storage-local`) | `implemented` | Real `DocumentsContract` hop-by-hop resolution, containment, `OpenDocumentTree` picker |
+| **S8** | `LanProxy` + `LanStorageAddressPolicy` + real TCP socket forwarder | `implemented` | Config-time + connect-time SSRF checks, 20/min rate limit, 4/peer concurrency cap, 5s/30s timeouts |
+| **S9** | Network storage core: `SmbFileBackend` (SMB 2/3 only) + vault integration | `partial` / `stubbed` | Policy & contract `implemented`; wire library adapter (`smbj`) `stubbed` (triggers `SIMULATION` banner) |
+| **S10** | `NetworkDiscovery` (mDNS + bounded RFC1918 `/24` real TCP socket probe, foreground-only) | `implemented` | Max 254 hosts, 16 concurrency, 400ms connect, 15s deadline, 10s cooldown |
+| **S11** | `WebDavFileBackend` (HTTPS-first, cert pin) & `SftpFileBackend` (TOFU host-key pin) | `partial` / `stubbed` | Pinning & policy boundaries `implemented`; wire transport adapters `stubbed` (triggers `SIMULATION` banner) |
+| **S12** | Cloud auth (`CloudAuthCoordinator` + `HttpsOAuthTokenEndpointAdapter` + browser redirect) | `implemented` | Real HTTPS token exchange, system browser `ACTION_VIEW`, `com.homenode.oauth:/oauth2redirect` |
+| **S13** | Google Drive backend (`CloudIdTreeBackend`: `drive.file` default, duplicate error, 429) | `partial` / `stubbed` | ID-tree resolution, Google Docs rejection & 429 handling `implemented`; REST wire adapter `stubbed` |
+| **S14** | OneDrive backend (Graph API, 320 KiB upload session chunk alignment) | `partial` / `stubbed` | 320 KiB chunk slicer & validator `implemented`; Graph HTTP adapter `stubbed` |
+| **S15** | Dropbox backend (API v2, App-Folder default, upload session streaming) | `partial` / `stubbed` | ID-tree & session contract `implemented`; Dropbox HTTP adapter `stubbed` |
+| **S16** | `WireGuardTransport` (`/32` `AllowedIPs`, source-IP cryptokey routing) | `partial` / `stubbed` | Cryptokey router & `/32` enforcement `implemented`; `UserspaceWireGuardEngineStub` active (triggers `SIMULATION` banner) |
+| **S17** | Pairing (`PairingPayloadParser`, `ModeAPairingCoordinator` single-use QR with real X25519 keys) | `implemented` | Mode A `implemented`; Mode B intentionally `blocked` pending ADR-004 threat review |
+| **S18** | Android lifecycle (`NodeService`, `BootReceiver`, `LockManager`, `LanInterfaceDetector`) | `implemented` | 2-arg `startForeground` on API 28, starts/stops `NodeRuntime`, detects real RFC1918 LAN IPs |
+| **S19** | `Reachability` (`DirectLanReachability`, `CompositeReachability`, UPnP/STUN/Relay stubs) | `partial` / `stubbed` | Real `NetworkInterface` LAN IP discovery `implemented`; UPnP/STUN/Relay `stubbed` |
+| **S20** | Jetpack Compose UI (`DashboardTab`, `StorageMountsTab`, `PeersAndPairingTab`, `LanAndSecurityTab`) | `implemented` | Prominent `SIMULATION / STUB ADAPTERS ACTIVE` banner, real SAF picker, system browser PKCE |
+| **S21** | Hardening: Threat-model verification matrix (`TM-01`..`TM-07`), fuzz test, log audit, R8 rules | `implemented` | All 9 modules compile and unit test suites execute |

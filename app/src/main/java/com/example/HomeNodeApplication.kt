@@ -1,19 +1,24 @@
 package com.example
 
 import android.app.Application
-import android.util.Log
+import com.homenode.service.node.HomeNodeFacade
+import com.homenode.service.node.OAuthClientIdConfig
 
-/**
- * Minimal bootstrap [Application] for Slice S0.
- * Announces stubbed status loudly at startup per Architecture Rule §3.
- */
 class HomeNodeApplication : Application() {
+  lateinit var facade: HomeNodeFacade
+    private set
+
   override fun onCreate() {
     super.onCreate()
-    Log.w(TAG, "BOOTSTRAP_STUB_ACTIVE: HomeNode Slice S0 scaffold initialized (no feature code yet).")
-  }
-
-  companion object {
-    private const val TAG = "HomeNodeBootstrapStub"
+    val oauthConfig = OAuthClientIdConfig(
+      googleDriveClientId = BuildConfig.GOOGLE_DRIVE_CLIENT_ID,
+      oneDriveClientId = BuildConfig.ONEDRIVE_CLIENT_ID,
+      dropboxClientId = BuildConfig.DROPBOX_CLIENT_ID,
+    )
+    facade = HomeNodeFacade(
+      storageDir = noBackupFilesDir,
+      appContext = applicationContext,
+      oauthClientIds = oauthConfig,
+    )
   }
 }
