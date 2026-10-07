@@ -81,13 +81,82 @@ class TransportAndReachabilityTest {
     val peerB = sampleKey(12)
     val nodeIp = TunnelIp.parse("10.66.0.1").getOrThrow()
     val ipA = TunnelIp.parse("10.66.0.10").getOrThrow()
+    val ipA2 = TunnelIp.parse("10.66.0.11").getOrThrow()
 
     val wg = WireGuardTransport(nodeKey, nodeIp)
     assertTrue(wg.isEngineStubbed)
+    assertEquals(TransportImplementationStatus.UNAVAILABLE, wg.implementationStatus)
+
+    // Reject registering node's own public key or own tunnel IP as a remote peer
+    assertTrue(wg.addPeer(PeerEndpointConfig(nodeKey, ipA)).isFailure)
+    assertTrue(wg.addPeer(PeerEndpointConfig(peerA, nodeIp)).isFailure)
+
     assertTrue(wg.addPeer(PeerEndpointConfig(peerA, ipA)).isSuccess)
     // Duplicate /32 IP for different peer must be rejected
     assertTrue(wg.addPeer(PeerEndpointConfig(peerB, ipA)).isFailure)
     assertEquals(peerA, wg.resolvePeerBySourceTunnelIp(ipA).getOrThrow())
+
+    // Updating peerA to a new /32 IP must unbind the previous IP (strict 1-to-1 peer -> tunnel IP invariant)
+    assertTrue(wg.addPeer(PeerEndpointConfig(peerA, ipA2)).isSuccess)
+    assertTrue("Old tunnel IP must be unbound when peer IP updates", wg.resolvePeerBySourceTunnelIp(ipA).isFailure)
+    assertEquals(peerA, wg.resolvePeerBySourceTunnelIp(ipA2).getOrThrow())
+
+    // Removing peerA unbinds ipA2 and denies openStream
+    assertTrue(wg.removePeer(peerA).isSuccess)
+    assertTrue(wg.resolvePeerBySourceTunnelIp(ipA2).isFailure)
+    val openRemoved = wg.openStream(peerA, 7001)
+    assertTrue(openRemoved.isFailure)
+    assertTrue((openRemoved as TransportResult.Failure).error is TransportError.PeerNotAuthorized)
+  }
+
+  @Test
+  fun testTransport_enforcesOneToOnePeerIpAndSupportsCleanRestart() = runTest {
+    val hub = TestTransportHub()
+    val nodeKey = sampleKey(30)
+    val peerKey = sampleKey(31)
+    val nodeIp = TunnelIp.parse("10.66.0.1").getOrThrow()
+    val peerIp1 = TunnelIp.parse("10.66.0.2").getOrThrow()
+    val peerIp2 = TunnelIp.parse("10.66.0.3").getOrThrow()
+
+    val nodeTransport = TestTransport(nodeKey, nodeIp, hub)
+    val peerTransport = TestTransport(peerKey, peerIp2, hub)
+    assertEquals(TransportImplementationStatus.SIMULATED, nodeTransport.implementationStatus)
+
+    // Self-key and self-IP rejected
+    assertTrue(nodeTransport.addPeer(PeerEndpointConfig(nodeKey, peerIp1)).isFailure)
+    assertTrue(nodeTransport.addPeer(PeerEndpointConfig(peerKey, nodeIp)).isFailure)
+
+    assertTrue(nodeTransport.addPeer(PeerEndpointConfig(peerKey, peerIp1)).isSuccess)
+    assertTrue(nodeTransport.addPeer(PeerEndpointConfig(peerKey, peerIp2)).isSuccess)
+    // Old IP must no longer verify
+    assertTrue(nodeTransport.verifyCryptokeySource(peerIp1, peerKey).isFailure)
+    assertTrue(nodeTransport.verifyCryptokeySource(peerIp2, peerKey).isSuccess)
+
+    // Start -> Stop -> Restart lifecycle
+    nodeTransport.start()
+    peerTransport.start()
+    peerTransport.addPeer(PeerEndpointConfig(nodeKey, nodeIp))
+
+    nodeTransport.stop()
+    assertEquals(TransportState.STOPPED, nodeTransport.state.value)
+    assertTrue(peerTransport.openStream(nodeKey, 7001).isFailure)
+
+    nodeTransport.start()
+    assertEquals(TransportState.RUNNING, nodeTransport.state.value)
+    val incoming = nodeTransport.listen(7001)
+    val job = backgroundScope.launch {
+      incoming.collect { s ->
+        val bytes = s.readFrameBytes(128).getOrThrow()
+        if (bytes != null) s.writeFrameBytes(bytes)
+      }
+    }
+    val s = peerTransport.openStream(nodeKey, 7001).getOrThrow()
+    s.writeFrameBytes(byteArrayOf(7, 8, 9))
+    assertArrayEquals(byteArrayOf(7, 8, 9), s.readFrameBytes(128).getOrThrow())
+    s.close()
+    job.cancel()
+    nodeTransport.stop()
+    peerTransport.stop()
   }
 
   @Test

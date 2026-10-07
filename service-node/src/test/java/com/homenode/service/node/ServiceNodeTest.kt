@@ -162,9 +162,16 @@ class ServiceNodeTest {
     )
 
     val destId = DestinationId("jellyfin_tv")
-    // Hostname or loopback must be rejected at config time
-    assertTrue(proxy.addAllowlistedDestination(destId, "Bad", "jellyfin.local", 8096).isFailure)
-    assertTrue(proxy.addAllowlistedDestination(destId, "Bad", "127.0.0.1", 8096).isFailure)
+    // Hostname, loopback, link-local, tunnel subnet, public IP, own IP, and invalid ports must be rejected
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad Hostname", "jellyfin.local", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad Loopback", "127.0.0.1", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad LinkLocal", "169.254.10.20", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad TunnelNode", "10.66.0.1", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad TunnelPeer", "10.66.4.12", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad OwnIp", "192.168.1.2", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad PublicIp", "8.8.8.8", 8096).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad Port 0", "192.168.1.80", 0).isFailure)
+    assertTrue(proxy.addAllowlistedDestination(destId, "Bad Port 70000", "192.168.1.80", 70_000).isFailure)
 
     // Valid RFC1918 IP literal succeeds
     assertTrue(proxy.addAllowlistedDestination(destId, "Jellyfin", "192.168.1.80", 8096).isSuccess)
@@ -309,5 +316,97 @@ class ServiceNodeTest {
     assertFalse(serializedLogs.contains("SecretBytes"))
     assertFalse(serializedLogs.contains("password"))
     assertFalse(serializedLogs.contains("@"))
+  }
+
+  @Test
+  fun nodeRuntime_cleansUpScopeOnIdentityFailureOrTransportExceptionAndIsIdempotent() = runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    val dir = Files.createTempDirectory("homenode_rt_fail_test").toFile()
+    val vault = KeystoreCredentialVault(dir, SoftwareAesGcmTestWrapper())
+    val identityMgr = NodeIdentityManager(dir, vault)
+
+    // Provision identity then delete vault key while leaving marker file -> fail-closed identity failure
+    identityMgr.loadOrInitializeIdentity().getOrThrow()
+    vault.delete(NodeIdentityManager.PRIVATE_KEY_VAULT_KEY)
+
+    val authorizer = PeerAuthorizer()
+    val logger = SafeEventLogger()
+    val retryScheduler = ComponentRetryScheduler(logger)
+    val cloudAuth = CloudAuthCoordinator(vault, dummyOAuthEndpoint())
+    val mountManager = MountManager(vault, authorizer, cloudAuth, retryScheduler, logger)
+    val lanProxy = LanProxy(authorizer, logger)
+
+    val transportKey = PeerPublicKey.fromBytes(ByteArray(32) { (it + 1).toByte() }).getOrThrow()
+    val transportIp = TunnelIp.parse("10.66.0.1").getOrThrow()
+    val transport = TestTransport(transportKey, transportIp)
+
+    val runtime = NodeRuntime(
+      identityManager = identityMgr,
+      transport = transport,
+      reachability = FakeReachability(),
+      mountManager = mountManager,
+      authorizer = authorizer,
+      lanProxy = lanProxy,
+      logger = logger,
+      retryScheduler = retryScheduler,
+      dispatcher = testDispatcher,
+    )
+
+    // 1. Identity failure -> NodeState.FAILED and zero leaked CoroutineScope
+    val failedSnap = runtime.start()
+    assertEquals(NodeState.FAILED, failedSnap.state)
+    assertFalse("runtimeScope must not leak when identity initialization fails", runtime.hasActiveRuntimeScope)
+
+    // 2. Explicit user identity regeneration -> subsequent start() succeeds; duplicate start() is idempotent
+    identityMgr.explicitUserRegenerateIdentity().getOrThrow()
+    val runningSnap1 = runtime.start()
+    val runningSnap2 = runtime.start()
+    assertEquals(NodeState.RUNNING, runningSnap1.state)
+    assertEquals(runningSnap1, runningSnap2)
+    assertTrue(runtime.hasActiveRuntimeScope)
+
+    // 3. Idempotent stop() cancels scope and transitions to STOPPED
+    assertEquals(NodeState.STOPPED, runtime.stop().state)
+    assertEquals(NodeState.STOPPED, runtime.stop().state)
+    assertFalse("runtimeScope must be cancelled after stop()", runtime.hasActiveRuntimeScope)
+  }
+
+  @Test
+  fun mountManager_safMountReflectsInsufficientWritePermissionInMountHealth() = runTest {
+    val vault = InMemoryCredentialVault()
+    val authorizer = PeerAuthorizer()
+    val logger = SafeEventLogger()
+    val scheduler = ComponentRetryScheduler(logger)
+    val cloudAuth = CloudAuthCoordinator(vault, dummyOAuthEndpoint())
+
+    val fakeSaf = com.homenode.storage.local.FakeSafTreeAdapter("tree:primary:Docs").apply {
+      readPermissionGranted = true
+      writePermissionGranted = false
+    }
+    val mountManager = MountManager(
+      vault = vault,
+      authorizer = authorizer,
+      cloudAuth = cloudAuth,
+      retryScheduler = scheduler,
+      logger = logger,
+      safAdapterFactory = { fakeSaf },
+    )
+
+    // Adding a read/write SAF mount when only READ permission is persisted -> MountState.NeedsReauth
+    val rwMount = mountManager.addMount(
+      label = "RW Folder With ReadOnly URI Grant",
+      provider = StorageProvider.SAF,
+      config = MountConfig.SafConfig("content://tree/primary%3ADocs"),
+      readOnly = false,
+    ).getOrThrow()
+    assertEquals(MountState.NeedsReauth, rwMount.state)
+
+    // Switching the mount to readOnly = true makes it Ready because READ permission is sufficient
+    val roUpdated = mountManager.setMountReadOnly(rwMount.id, readOnly = true).getOrThrow()
+    assertEquals(MountState.Ready, roUpdated.state)
+
+    // Switching back to readOnly = false while WRITE permission is still missing transitions back to NeedsReauth
+    val rwAgain = mountManager.setMountReadOnly(rwMount.id, readOnly = false).getOrThrow()
+    assertEquals(MountState.NeedsReauth, rwAgain.state)
   }
 }

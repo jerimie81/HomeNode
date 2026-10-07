@@ -46,7 +46,44 @@ class SafFileBackendTest {
     // 4. Removable microSD card eject maps to UNAVAILABLE and recovers when re-mounted
     adapter.mounted = false
     assertEquals(StorageError.UNAVAILABLE, (backend.stat(photo) as StorageResult.Failure).error)
+    assertEquals(com.homenode.core.storage.MountState.Unavailable, backend.evaluateMountState())
     adapter.mounted = true
     assertTrue(backend.stat(photo).isSuccess)
+    assertEquals(com.homenode.core.storage.MountState.Ready, backend.evaluateMountState())
+  }
+
+  @Test
+  fun safBackend_readWriteMountRequiresWritePermissionWhileReadOnlyMountRequiresOnlyReadPermission() = runTest {
+    val adapter = FakeSafTreeAdapter("tree:primary:Shared")
+    // Seed a file while both READ and WRITE permissions are present
+    val rwSetup = SafFileBackend(adapter, isReadOnly = false, listingCacheTtlMs = 0L)
+    val file = PathValidator.parseRelative("doc.txt").getOrThrow()
+    assertTrue(rwSetup.write(file, WriteMode.CREATE_NEW, flowOf("hello".encodeToByteArray()), 5L).isSuccess)
+
+    // Now simulate persisted URI permission having READ=true, WRITE=false
+    adapter.readPermissionGranted = true
+    adapter.writePermissionGranted = false
+
+    // 1. A read-only mount (isReadOnly = true) only requires READ permission -> Ready & readable
+    val roBackend = SafFileBackend(adapter, isReadOnly = true, listingCacheTtlMs = 0L)
+    assertEquals(com.homenode.core.storage.MountState.Ready, roBackend.evaluateMountState())
+    assertTrue(roBackend.stat(file).isSuccess)
+    assertTrue(roBackend.list(SafePath.ROOT).isSuccess)
+    assertEquals(
+      StorageError.DENIED,
+      (roBackend.write(file, WriteMode.OVERWRITE, flowOf(byteArrayOf(1)), 1L) as StorageResult.Failure).error
+    )
+
+    // 2. A read/write mount (isReadOnly = false) requires READ + WRITE permission -> fails closed with PERMISSION_LOST / NeedsReauth
+    val rwBackend = SafFileBackend(adapter, isReadOnly = false, listingCacheTtlMs = 0L)
+    assertEquals(com.homenode.core.storage.MountState.NeedsReauth, rwBackend.evaluateMountState())
+    assertEquals(
+      StorageError.PERMISSION_LOST,
+      (rwBackend.stat(file) as StorageResult.Failure).error
+    )
+    assertEquals(
+      StorageError.PERMISSION_LOST,
+      (rwBackend.write(file, WriteMode.OVERWRITE, flowOf(byteArrayOf(1)), 1L) as StorageResult.Failure).error
+    )
   }
 }

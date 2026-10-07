@@ -30,9 +30,13 @@ import com.homenode.core.transport.PeerPublicKey
 import com.homenode.core.transport.StunReachabilityStub
 import com.homenode.core.transport.TestTransport
 import com.homenode.core.transport.TestTransportHub
+import com.homenode.core.transport.Transport
+import com.homenode.core.transport.TransportImplementationStatus
+import com.homenode.core.transport.TransportSelectionMode
 import com.homenode.core.transport.TunnelIp
 import com.homenode.core.transport.TunnelSpikeHarness
 import com.homenode.core.transport.UpnpReachabilityStub
+import com.homenode.core.transport.WireGuardTransport
 import com.homenode.core.transport.getOrElse
 import com.homenode.storage.cloud.CloudAuthCoordinator
 import com.homenode.storage.cloud.CloudProviderScopes
@@ -143,6 +147,8 @@ data class HomeNodeUiState(
   val statusBanner: String = "Node stopped",
   val nodeId: String = "—",
   val nodePublicKeyShort: String = "—",
+  val transportMode: String = TransportSelectionMode.TEST_IN_PROCESS.name,
+  val transportImplementationStatus: String = TransportImplementationStatus.SIMULATED.name,
   val isKeystoreBackedVault: Boolean = false,
   val activeSimulationWarnings: List<String> = emptyList(),
   val endpoints: List<String> = emptyList(),
@@ -172,7 +178,10 @@ data class HomeNodeUiState(
  * 2. Uses real [AndroidKeystoreAesGcmWrapper] via [AesGcmKeyWrapper.createDefault] on Android devices.
  * 3. Uses real [HttpsOAuthTokenEndpointAdapter] — NEVER fakes OAuth token exchange or pre-populates fake logged-in cloud accounts.
  * 4. Uses real [AndroidContentResolverSafTreeAdapter] (`DocumentsContract`) when mounting `content://` SAF document trees.
- * 5. Computes `activeSimulationWarnings` continuously so the UI renders a prominent **SIMULATION / STUB ADAPTERS ACTIVE**
+ * 5. Explicitly separates [TransportSelectionMode.TEST_IN_PROCESS] ([TestTransport]) from
+ *    [TransportSelectionMode.PRODUCTION_WIREGUARD] ([WireGuardTransport]) and exposes [TransportImplementationStatus]
+ *    (`REAL`, `SIMULATED`, `UNAVAILABLE`).
+ * 6. Computes `activeSimulationWarnings` continuously so the UI renders a prominent **SIMULATION / STUB ADAPTERS ACTIVE**
  *    banner whenever any stubbed component (e.g. `TestTransport`, `FakeSafTreeAdapter`, `FakeSmbSessionAdapter`, or stubbed
  *    network/cloud wire adapters) is present.
  */
@@ -182,6 +191,8 @@ class HomeNodeFacade(
   private val oauthClientIds: OAuthClientIdConfig = OAuthClientIdConfig(),
   keyWrapper: AesGcmKeyWrapper = AesGcmKeyWrapper.createDefault(),
   oauthEndpoint: OAuthTokenEndpointAdapter = HttpsOAuthTokenEndpointAdapter(),
+  val transportSelectionMode: TransportSelectionMode = TransportSelectionMode.TEST_IN_PROCESS,
+  customTransport: Transport? = null,
 ) {
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
   private val vaultDir = File(storageDir, "no_backup_vault")
@@ -199,7 +210,12 @@ class HomeNodeFacade(
   private val initialTransportKey =
     PeerPublicKey.fromBytes(NodeIdentityManager.generateEphemeralKeypair().second.toBytes()).getOrThrow()
   private val nodeTunnelIp = TunnelIp.parse("10.66.0.1").getOrThrow()
-  private val transport = TestTransport(initialTransportKey, nodeTunnelIp, hub)
+  val transport: Transport = customTransport ?: when (transportSelectionMode) {
+    TransportSelectionMode.TEST_IN_PROCESS ->
+      TestTransport(initialTransportKey, nodeTunnelIp, hub)
+    TransportSelectionMode.PRODUCTION_WIREGUARD ->
+      WireGuardTransport(initialTransportKey, nodeTunnelIp)
+  }
 
   private val reachability = CompositeReachability(
     listOf(
@@ -882,8 +898,14 @@ class HomeNodeFacade(
 
   private fun computeActiveSimulationWarnings(): List<String> {
     val warnings = mutableListOf<String>()
-    // 1. Transport engine status
-    warnings.add("Transport: In-process TestTransport active (Native WireGuard JNI engine stubbed pending S8+ NDK build)")
+    // 1. Transport engine status (REAL vs SIMULATED vs UNAVAILABLE)
+    when (transport.implementationStatus) {
+      TransportImplementationStatus.SIMULATED ->
+        warnings.add("Transport: In-process TestTransport active (mode=$transportSelectionMode, status=SIMULATED)")
+      TransportImplementationStatus.UNAVAILABLE ->
+        warnings.add("Transport: WireGuardTransport selected, but native engine is UNAVAILABLE (UserspaceWireGuardEngineStub active)")
+      TransportImplementationStatus.REAL -> Unit
+    }
     // 2. Keystore vs JVM fallback
     if (!vault.isAndroidKeystoreBacked) {
       warnings.add("CredentialVault: SoftwareAesGcmTestWrapper active (AndroidKeyStore unavailable in host JVM)")
@@ -983,6 +1005,8 @@ class HomeNodeFacade(
       statusBanner = statusBanner,
       nodeId = snap.identity?.nodeId ?: "—",
       nodePublicKeyShort = snap.identity?.publicKey?.shortId ?: "—",
+      transportMode = transportSelectionMode.name,
+      transportImplementationStatus = transport.implementationStatus.name,
       isKeystoreBackedVault = vault.isAndroidKeystoreBacked,
       activeSimulationWarnings = computeActiveSimulationWarnings(),
       endpoints = snap.endpoints.map { "${it.hostIpLiteral}:${it.port} (${it.kind.name})" },

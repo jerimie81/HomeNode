@@ -53,10 +53,10 @@ class AndroidContentResolverSafTreeAdapter(
     }
   }
 
-  override fun verifyPermissionGranted(): Boolean {
+  override fun verifyPermissionGranted(requireWrite: Boolean): Boolean {
     val persisted = contentResolver.persistedUriPermissions
     return persisted.any { perm ->
-      perm.uri == treeUri && perm.isReadPermission
+      perm.uri == treeUri && perm.isReadPermission && (!requireWrite || perm.isWritePermission)
     }
   }
 

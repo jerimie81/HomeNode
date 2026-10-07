@@ -7,11 +7,15 @@ import com.homenode.core.storage.StorageResult
 import com.homenode.core.transport.EndpointHint
 import com.homenode.core.transport.Reachability
 import com.homenode.core.transport.Transport
+import com.homenode.core.transport.TransportImplementationStatus
 import com.homenode.core.transport.TransportResult
+import com.homenode.core.transport.TransportState
 import com.homenode.service.files.FileService
+import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -42,10 +46,12 @@ data class NodeRuntimeSnapshot(
  * Central node state machine & recovery coordinator (`NodeRuntime`) (§11, Slice S2).
  * Startup order:
  * `load identity -> open vault -> start Transport -> start Reachability -> start MountManager -> start FileService -> start LanProxy`.
- * - Single owner `CoroutineScope(SupervisorJob() + dispatcher)` cancelled on `stop()`.
+ * - Single owner `CoroutineScope(SupervisorJob() + dispatcher)` created only after identity verification and
+ *   always cancelled/cleared on startup failure or `stop()`.
  * - All state transitions serialized through a single [Mutex].
  * - Wi-Fi loss or impaired mount degrades node to [NodeState.DEGRADED], never [NodeState.FAILED].
- * - Identity corruption transitions node to [NodeState.FAILED] (fail-closed).
+ * - Identity corruption or unrecoverable startup exception transitions node to [NodeState.FAILED] (fail-closed)
+ *   with deterministic cleanup of any partially-started components.
  */
 class NodeRuntime(
   private val identityManager: NodeIdentityManager,
@@ -60,6 +66,9 @@ class NodeRuntime(
 ) {
   private val transitionMutex = Mutex()
   private var runtimeScope: CoroutineScope? = null
+
+  internal val hasActiveRuntimeScope: Boolean
+    get() = runtimeScope?.coroutineContext?.get(Job)?.isActive == true
 
   private val fileService = FileService(
     transport = transport,
@@ -77,6 +86,9 @@ class NodeRuntime(
       return@withLock _snapshot.value
     }
 
+    // Defensive cleanup in case previous run ended in FAILED
+    cleanupComponentsLocked()
+
     logger.logNodeStarting()
     _snapshot.value = _snapshot.value.copy(
       state = NodeState.STARTING,
@@ -84,64 +96,84 @@ class NodeRuntime(
       failedReason = null,
     )
 
-    val scope = CoroutineScope(SupervisorJob() + dispatcher)
-    runtimeScope = scope
+    try {
+      // 1. Load identity BEFORE creating runtimeScope or starting transport (fail-closed if Keystore/vault corrupted)
+      val idRes = identityManager.loadOrInitializeIdentity()
+      if (idRes is StorageResult.Failure) {
+        _snapshot.value = _snapshot.value.copy(
+          state = NodeState.FAILED,
+          degradedReason = null,
+          failedReason = idRes.message,
+        )
+        return@withLock _snapshot.value
+      }
+      val nodeIdentity = (idRes as StorageResult.Success).value
 
-    // 1. Load identity (fail-closed if Keystore/vault corrupted)
-    val idRes = identityManager.loadOrInitializeIdentity()
-    if (idRes is StorageResult.Failure) {
+      // 2. Create runtime CoroutineScope only after identity succeeds
+      val scope = CoroutineScope(SupervisorJob() + dispatcher)
+      runtimeScope = scope
+
+      // 3. Start Transport
+      val transportRes = transport.start()
+      val transportDegraded = transportRes is TransportResult.Failure ||
+        transport.state.value != TransportState.RUNNING
+
+      // 4. Discover Reachability endpoints
+      val endpoints = runCatching { reachability.discoverEndpoints(51820) }.getOrDefault(emptyList())
+      logger.logTransportConnected(endpoints.size)
+
+      // 5. Start FileService over Transport
+      fileService.start(scope)
+
+      // 6. Compute RUNNING vs DEGRADED state
+      val mountsImpaired = mountManager.hasAnyImpairedMount()
+      val nextState = computeActiveState(
+        wifiConnected = _snapshot.value.wifiConnected,
+        transportDegraded = transportDegraded,
+        mountsImpaired = mountsImpaired,
+      )
+      val reason = buildDegradedReason(
+        wifiConnected = _snapshot.value.wifiConnected,
+        transportDegraded = transportDegraded,
+        mountsImpaired = mountsImpaired,
+      )
+
+      _snapshot.value = NodeRuntimeSnapshot(
+        state = nextState,
+        degradedReason = reason,
+        failedReason = null,
+        identity = nodeIdentity,
+        endpoints = endpoints,
+        wifiConnected = _snapshot.value.wifiConnected,
+      )
+      logger.logNodeRunning(nextState.name)
+      return@withLock _snapshot.value
+    } catch (ce: CancellationException) {
+      cleanupComponentsLocked()
+      _snapshot.value = _snapshot.value.copy(
+        state = NodeState.STOPPED,
+        degradedReason = null,
+      )
+      throw ce
+    } catch (t: Throwable) {
+      cleanupComponentsLocked()
+      val failMsg = "Startup failed: ${t.message ?: t.javaClass.simpleName}"
       _snapshot.value = _snapshot.value.copy(
         state = NodeState.FAILED,
-        failedReason = idRes.message,
+        degradedReason = null,
+        failedReason = failMsg,
       )
       return@withLock _snapshot.value
     }
-    val nodeIdentity = (idRes as StorageResult.Success).value
-
-    // 2. Start Transport
-    val transportRes = transport.start()
-    val transportDegraded = transportRes is TransportResult.Failure
-
-    // 3. Discover Reachability endpoints
-    val endpoints = runCatching { reachability.discoverEndpoints(51820) }.getOrDefault(emptyList())
-    logger.logTransportConnected(endpoints.size)
-
-    // 4. Start FileService over Transport
-    fileService.start(scope)
-
-    // 5. Compute RUNNING vs DEGRADED state
-    val nextState = computeActiveState(
-      wifiConnected = _snapshot.value.wifiConnected,
-      transportDegraded = transportDegraded,
-      mountsImpaired = mountManager.hasAnyImpairedMount(),
-    )
-    val reason = buildDegradedReason(
-      wifiConnected = _snapshot.value.wifiConnected,
-      transportDegraded = transportDegraded,
-      mountsImpaired = mountManager.hasAnyImpairedMount(),
-    )
-
-    _snapshot.value = NodeRuntimeSnapshot(
-      state = nextState,
-      degradedReason = reason,
-      failedReason = null,
-      identity = nodeIdentity,
-      endpoints = endpoints,
-      wifiConnected = _snapshot.value.wifiConnected,
-    )
-    logger.logNodeRunning(nextState.name)
-    return@withLock _snapshot.value
   }
 
   suspend fun stop(): NodeRuntimeSnapshot = transitionMutex.withLock {
-    if (_snapshot.value.state == NodeState.STOPPED) return@withLock _snapshot.value
+    if (_snapshot.value.state == NodeState.STOPPED && runtimeScope == null) {
+      return@withLock _snapshot.value
+    }
     _snapshot.value = _snapshot.value.copy(state = NodeState.STOPPING)
 
-    retryScheduler.cancelAll()
-    fileService.stop()
-    transport.stop()
-    runtimeScope?.cancel()
-    runtimeScope = null
+    cleanupComponentsLocked()
 
     _snapshot.value = _snapshot.value.copy(
       state = NodeState.STOPPED,
@@ -149,6 +181,14 @@ class NodeRuntime(
     )
     logger.logNodeStopped()
     return@withLock _snapshot.value
+  }
+
+  private suspend fun cleanupComponentsLocked() {
+    runCatching { retryScheduler.cancelAll() }
+    runCatching { fileService.stop() }
+    runCatching { transport.stop() }
+    runtimeScope?.cancel()
+    runtimeScope = null
   }
 
   /**
@@ -161,15 +201,16 @@ class NodeRuntime(
       _snapshot.value = cur.copy(wifiConnected = wifiAvailable)
       return@withLock
     }
+    val transportDegraded = transport.state.value != TransportState.RUNNING
     val mountsImpaired = mountManager.hasAnyImpairedMount()
     val nextState = computeActiveState(
       wifiConnected = wifiAvailable,
-      transportDegraded = false,
+      transportDegraded = transportDegraded,
       mountsImpaired = mountsImpaired,
     )
     val reason = buildDegradedReason(
       wifiConnected = wifiAvailable,
-      transportDegraded = false,
+      transportDegraded = transportDegraded,
       mountsImpaired = mountsImpaired,
     )
     _snapshot.value = cur.copy(
@@ -182,15 +223,16 @@ class NodeRuntime(
   suspend fun refreshMountHealthState() = transitionMutex.withLock {
     val cur = _snapshot.value
     if (cur.state != NodeState.RUNNING && cur.state != NodeState.DEGRADED) return@withLock
+    val transportDegraded = transport.state.value != TransportState.RUNNING
     val mountsImpaired = mountManager.hasAnyImpairedMount()
     val nextState = computeActiveState(
       wifiConnected = cur.wifiConnected,
-      transportDegraded = false,
+      transportDegraded = transportDegraded,
       mountsImpaired = mountsImpaired,
     )
     val reason = buildDegradedReason(
       wifiConnected = cur.wifiConnected,
-      transportDegraded = false,
+      transportDegraded = transportDegraded,
       mountsImpaired = mountsImpaired,
     )
     _snapshot.value = cur.copy(state = nextState, degradedReason = reason)
@@ -215,7 +257,16 @@ class NodeRuntime(
   ): String? {
     val reasons = mutableListOf<String>()
     if (!wifiConnected) reasons.add("Wi-Fi LAN disconnected")
-    if (transportDegraded) reasons.add("WireGuard engine stubbed (TestTransport active in-process)")
+    if (transportDegraded) {
+      when (transport.implementationStatus) {
+        TransportImplementationStatus.UNAVAILABLE ->
+          reasons.add("WireGuard engine unavailable (UserspaceWireGuardEngineStub active)")
+        TransportImplementationStatus.SIMULATED ->
+          reasons.add("TestTransport degraded")
+        TransportImplementationStatus.REAL ->
+          reasons.add("WireGuard transport degraded")
+      }
+    }
     if (mountsImpaired) reasons.add("One or more storage mounts require attention")
     return if (reasons.isEmpty()) null else reasons.joinToString(" · ")
   }

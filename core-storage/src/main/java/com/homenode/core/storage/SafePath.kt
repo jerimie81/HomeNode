@@ -66,6 +66,9 @@ object PathValidator {
       return StorageResult.Failure(StorageError.PATH_INVALID, "Path exceeds max length $MAX_TOTAL_LENGTH")
     }
     val nfc = Normalizer.normalize(rawInput, Normalizer.Form.NFC)
+    if (nfc.length > MAX_TOTAL_LENGTH) {
+      return StorageResult.Failure(StorageError.PATH_INVALID, "Normalized path exceeds max length $MAX_TOTAL_LENGTH")
+    }
     if (nfc == "/") {
       return StorageResult.Success(VirtualPath(mountId = null, relativePath = SafePath.ROOT))
     }

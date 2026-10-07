@@ -127,6 +127,11 @@ class CoreIdentityTest {
     // Explicit user regeneration creates a fresh identity
     val regenerated = mgr.explicitUserRegenerateIdentity().getOrThrow()
     assertFalse(first.publicKey == regenerated.publicKey)
+
+    // Simulate tampering with identity_meta_v1.prop publicKey -> must fail closed on reload
+    val marker = File(dir, "identity_meta_v1.prop")
+    marker.writeText("version=1\nnodeId=${regenerated.nodeId}\npublicKey=${first.publicKey.base64Url}\n")
+    assertTrue("Mismatched marker publicKey must fail closed", mgr.loadOrInitializeIdentity().isFailure)
   }
 
   @Test

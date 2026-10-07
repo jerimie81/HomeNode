@@ -293,6 +293,10 @@ class FileService(
     req: ProtocolMessage.ReadReq,
     negotiatedMaxFrame: Int,
   ) {
+    if (req.offset < 0L || req.length < 0L) {
+      sendError(stream, requestId, StorageError.PATH_INVALID.name, "Negative offset or length is forbidden")
+      return
+    }
     val vpRes = PathValidator.parseVirtualPath(req.virtualPath)
     if (vpRes is StorageResult.Failure) {
       sendStorageFailure(stream, requestId, vpRes)
@@ -304,10 +308,30 @@ class FileService(
       return
     }
     val backend = authorizeAndResolveBackend(stream, peerId, requestId, mountId, AccessMode.READ) ?: return
+    val maxSliceBytes = negotiatedMaxFrame.coerceIn(1024, FrameCodec.MAX_FRAME_BYTES)
     try {
       backend.open(vp.relativePath, req.offset, req.length).collect { chunk ->
-        val frame = WireFrame(FrameType.DATA, 0, requestId, chunk)
-        stream.writeFrameBytes(FrameCodec.encodeFrame(frame, negotiatedMaxFrame))
+        // Re-check peer authorization and mount presence on each chunk for concurrent revocation safety
+        if (!authorizer.can(peerId, Capability.Files(mountId, AccessMode.READ))) {
+          onRequestDeniedAudit()
+          throw StorageException(StorageError.DENIED, "Peer READ capability revoked during stream")
+        }
+        val currentMount = mountCatalog.getMount(mountId)
+        if (currentMount == null || currentMount.state is MountState.Removed) {
+          throw StorageException(StorageError.NOT_FOUND, "Mount removed during READ stream")
+        }
+        var offsetInChunk = 0
+        while (offsetInChunk < chunk.size) {
+          val end = (offsetInChunk + maxSliceBytes).coerceAtMost(chunk.size)
+          val slice = if (offsetInChunk == 0 && end == chunk.size) {
+            chunk
+          } else {
+            chunk.copyOfRange(offsetInChunk, end)
+          }
+          val frame = WireFrame(FrameType.DATA, 0, requestId, slice)
+          stream.writeFrameBytes(FrameCodec.encodeFrame(frame, negotiatedMaxFrame))
+          offsetInChunk = end
+        }
       }
       val endFrame = WireFrame(FrameType.END, 0, requestId, ByteArray(0))
       stream.writeFrameBytes(FrameCodec.encodeFrame(endFrame, negotiatedMaxFrame))
@@ -323,6 +347,14 @@ class FileService(
     req: ProtocolMessage.WriteReq,
     negotiatedMaxFrame: Int,
   ) {
+    if (req.expectedSize < 0L) {
+      sendError(stream, requestId, StorageError.PATH_INVALID.name, "Negative expectedSize is forbidden")
+      return
+    }
+    if (req.expectedSize > FileBackend.MAX_WRITE_SIZE_BYTES) {
+      sendError(stream, requestId, StorageError.QUOTA.name, "Write expectedSize exceeds 2 GiB maximum")
+      return
+    }
     val vpRes = PathValidator.parseVirtualPath(req.virtualPath)
     if (vpRes is StorageResult.Failure) {
       sendStorageFailure(stream, requestId, vpRes)
@@ -335,14 +367,44 @@ class FileService(
     }
     val backend = authorizeAndResolveBackend(stream, peerId, requestId, mountId, AccessMode.WRITE) ?: return
 
+    var receivedBytes = 0L
     val dataFlow = flow {
       while (true) {
-        val nextRaw = stream.readFrameBytes(negotiatedMaxFrame + FrameCodec.HEADER_BYTES).getOrThrow()
-          ?: throw StorageException(StorageError.CANCELLED, "Stream closed mid-write")
+        val rawRes = stream.readFrameBytes(negotiatedMaxFrame + FrameCodec.HEADER_BYTES)
+        if (rawRes is TransportResult.Failure) {
+          throw StorageException(StorageError.PATH_INVALID, "Frame exceeded negotiated max size during WRITE")
+        }
+        val nextRaw = (rawRes as TransportResult.Success).value
+          ?: throw StorageException(StorageError.CANCELLED, "Stream closed mid-write before END frame")
         val nextFrame = (FrameCodec.decodeFrame(nextRaw, negotiatedMaxFrame) as? CodecResult.Success)?.value
           ?: throw StorageException(StorageError.PATH_INVALID, "Malformed DATA/END frame during write")
+        if (nextFrame.requestId != requestId) {
+          throw StorageException(StorageError.PATH_INVALID, "Mismatched requestId on WRITE stream frame")
+        }
+        // Re-check peer authorization and mount writability during streaming write
+        if (!authorizer.can(peerId, Capability.Files(mountId, AccessMode.WRITE))) {
+          onRequestDeniedAudit()
+          throw StorageException(StorageError.DENIED, "Peer WRITE capability revoked during stream")
+        }
+        val currentMount = mountCatalog.getMount(mountId)
+        if (currentMount == null || currentMount.state is MountState.Removed) {
+          throw StorageException(StorageError.NOT_FOUND, "Mount removed during WRITE stream")
+        }
+        if (currentMount.readOnly) {
+          onRequestDeniedAudit()
+          throw StorageException(StorageError.DENIED, "Mount switched to read-only during WRITE stream")
+        }
         when (nextFrame.type) {
-          FrameType.DATA -> emit(nextFrame.payload)
+          FrameType.DATA -> {
+            receivedBytes += nextFrame.payload.size
+            if (receivedBytes > FileBackend.MAX_WRITE_SIZE_BYTES) {
+              throw StorageException(StorageError.QUOTA, "Stream exceeded max write size")
+            }
+            if (receivedBytes > req.expectedSize) {
+              throw StorageException(StorageError.PATH_INVALID, "Streamed bytes exceeded expectedSize")
+            }
+            emit(nextFrame.payload)
+          }
           FrameType.END -> break
           FrameType.CANCEL -> throw StorageException(StorageError.CANCELLED, "Write cancelled by peer")
           else -> throw StorageException(StorageError.PATH_INVALID, "Expected DATA or END frame")
@@ -350,9 +412,13 @@ class FileService(
       }
     }
 
-    when (val res = backend.write(vp.relativePath, req.mode, dataFlow, req.expectedSize)) {
-      is StorageResult.Success -> sendOk(stream, requestId, ProtocolV2PayloadCodec.encodeOkStat(res.value))
-      is StorageResult.Failure -> sendStorageFailure(stream, requestId, res)
+    try {
+      when (val res = backend.write(vp.relativePath, req.mode, dataFlow, req.expectedSize)) {
+        is StorageResult.Success -> sendOk(stream, requestId, ProtocolV2PayloadCodec.encodeOkStat(res.value))
+        is StorageResult.Failure -> sendStorageFailure(stream, requestId, res)
+      }
+    } catch (se: StorageException) {
+      sendStorageFailure(stream, requestId, StorageResult.Failure(se.error, se.message))
     }
   }
 

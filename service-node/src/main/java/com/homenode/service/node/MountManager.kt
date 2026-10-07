@@ -143,6 +143,12 @@ class MountManager(
       )
     }
 
+    val effectiveInitialState = if (initialState is MountState.Ready && backend is SafFileBackend) {
+      backend.evaluateMountState()
+    } else {
+      initialState
+    }
+
     val initialMount = StorageMount(
       id = mountId,
       kind = provider.kind,
@@ -151,7 +157,7 @@ class MountManager(
       config = config,
       credentialRef = credKey,
       readOnly = readOnly,
-      state = initialState,
+      state = effectiveInitialState,
     )
 
     mountsById[mountId] = initialMount
@@ -164,15 +170,23 @@ class MountManager(
   suspend fun setMountReadOnly(mountId: MountId, readOnly: Boolean): StorageResult<StorageMount> {
     val existing = mountsById[mountId]
       ?: return StorageResult.Failure(StorageError.NOT_FOUND, "Mount not found")
-    val updated = existing.copy(readOnly = readOnly)
-    mountsById[mountId] = updated
-    backendsById[mountId] = buildBackendForMount(
+    val newBackend = buildBackendForMount(
       mountId = mountId,
-      provider = updated.provider,
-      config = updated.config,
-      credKey = updated.credentialRef,
+      provider = existing.provider,
+      config = existing.config,
+      credKey = existing.credentialRef,
       readOnly = readOnly,
     )
+    val nextState = if (newBackend is SafFileBackend &&
+      (existing.state is MountState.Ready || existing.state is MountState.NeedsReauth || existing.state is MountState.Unavailable)
+    ) {
+      newBackend.evaluateMountState()
+    } else {
+      existing.state
+    }
+    val updated = existing.copy(readOnly = readOnly, state = nextState)
+    mountsById[mountId] = updated
+    backendsById[mountId] = newBackend
     publishMounts()
     return StorageResult.Success(updated)
   }

@@ -44,6 +44,8 @@ class TestTransport(
 
   private val _state = MutableStateFlow(TransportState.STOPPED)
   override val state: StateFlow<TransportState> = _state.asStateFlow()
+  override val implementationStatus: TransportImplementationStatus =
+    TransportImplementationStatus.SIMULATED
 
   private val peersByKey = ConcurrentHashMap<PeerPublicKey, PeerEndpointConfig>()
   private val keyByTunnelIp = ConcurrentHashMap<TunnelIp, PeerPublicKey>()
@@ -68,13 +70,27 @@ class TestTransport(
   }
 
   override suspend fun addPeer(config: PeerEndpointConfig): TransportResult<Unit> {
+    if (config.peerPublicKey == localPublicKey) {
+      return TransportResult.Failure(
+        TransportError.InvalidConfig("Cannot register local node public key as remote peer")
+      )
+    }
+    if (config.allowedTunnelIp == localTunnelIp) {
+      return TransportResult.Failure(
+        TransportError.InvalidConfig("Peer tunnel IP ${config.allowedTunnelIp} conflicts with local node tunnel IP")
+      )
+    }
     val existingKeyForIp = keyByTunnelIp[config.allowedTunnelIp]
     if (existingKeyForIp != null && existingKeyForIp != config.peerPublicKey) {
       return TransportResult.Failure(
         TransportError.InvalidConfig("Tunnel IP ${config.allowedTunnelIp} already assigned to another peer")
       )
     }
-    peersByKey[config.peerPublicKey] = config
+    // Enforce strict 1-to-1 peer -> tunnel IP mapping by removing any prior IP owned by this peer
+    val previousConfig = peersByKey.put(config.peerPublicKey, config)
+    if (previousConfig != null && previousConfig.allowedTunnelIp != config.allowedTunnelIp) {
+      keyByTunnelIp.remove(previousConfig.allowedTunnelIp, config.peerPublicKey)
+    }
     keyByTunnelIp[config.allowedTunnelIp] = config.peerPublicKey
     return TransportResult.Success(Unit)
   }

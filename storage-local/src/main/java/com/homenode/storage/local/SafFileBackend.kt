@@ -37,7 +37,7 @@ interface SafTreeAdapter {
   val rootDocumentId: String
   val isSimulated: Boolean
   fun isMediaMounted(): Boolean
-  fun verifyPermissionGranted(): Boolean
+  fun verifyPermissionGranted(requireWrite: Boolean = false): Boolean
   fun isChildDocument(parentDocumentId: String, candidateDocumentId: String): Boolean
   fun queryChildren(parentDocumentId: String): List<SafDocumentMetadata>
   fun statDocument(documentId: String): SafDocumentMetadata?
@@ -59,6 +59,7 @@ interface SafTreeAdapter {
  * Enforces:
  * - Segment-wise display-name resolution from `rootDocumentId`
  * - Strict containment verification (`isChildDocument`) at every hop and before final I/O
+ * - Read-only mounts require persisted `READ` URI permission; read/write mounts require `READ + WRITE`
  * - Duplicate display name detection (`StorageError.DUPLICATE_NAME`)
  * - `SecurityException` -> `StorageError.PERMISSION_LOST`
  * - Removable media removal -> `StorageError.UNAVAILABLE`
@@ -82,14 +83,39 @@ class SafFileBackend(
 
   private val listingCache = ConcurrentHashMap<String, CachedListing>()
 
-  private fun checkMediaAndPermissions(): StorageResult<Unit> {
+  /**
+   * Verifies removable media mount state and persisted SAF URI permissions:
+   * - Read-only mounts (`isReadOnly == true`) require persisted `READ` permission.
+   * - Read/write mounts (`isReadOnly == false`) require persisted `READ + WRITE` permissions (fail-closed).
+   */
+  fun checkMediaAndPermissions(requireWrite: Boolean = !isReadOnly): StorageResult<Unit> {
     if (!adapter.isMediaMounted()) {
       return StorageResult.Failure(StorageError.UNAVAILABLE, "Removable microSD or storage volume is unmounted")
     }
-    if (!adapter.verifyPermissionGranted()) {
-      return StorageResult.Failure(StorageError.PERMISSION_LOST, "SAF persisted URI permission was revoked")
+    if (!adapter.verifyPermissionGranted(requireWrite = requireWrite)) {
+      val msg = if (requireWrite) {
+        "SAF persisted URI permission lacks required READ+WRITE access"
+      } else {
+        "SAF persisted URI permission was revoked"
+      }
+      return StorageResult.Failure(StorageError.PERMISSION_LOST, msg)
     }
     return StorageResult.Success(Unit)
+  }
+
+  /**
+   * Evaluates current mount health for [com.homenode.service.node.MountManager] so insufficient
+   * persisted permissions or ejected media immediately reflect in [com.homenode.core.storage.MountState].
+   */
+  fun evaluateMountState(): com.homenode.core.storage.MountState {
+    return when (val check = checkMediaAndPermissions(requireWrite = !isReadOnly)) {
+      is StorageResult.Success -> com.homenode.core.storage.MountState.Ready
+      is StorageResult.Failure -> when (check.error) {
+        StorageError.PERMISSION_LOST -> com.homenode.core.storage.MountState.NeedsReauth
+        StorageError.UNAVAILABLE -> com.homenode.core.storage.MountState.Unavailable
+        else -> com.homenode.core.storage.MountState.Degraded(check.message)
+      }
+    }
   }
 
   private fun queryChildrenCached(parentDocId: String): List<SafDocumentMetadata> {
@@ -403,7 +429,15 @@ class FakeSafTreeAdapter(
 ) : SafTreeAdapter {
   override val isSimulated: Boolean = true
   var mounted: Boolean = true
-  var permissionGranted: Boolean = true
+  var readPermissionGranted: Boolean = true
+  var writePermissionGranted: Boolean = true
+
+  var permissionGranted: Boolean
+    get() = readPermissionGranted && writePermissionGranted
+    set(value) {
+      readPermissionGranted = value
+      writePermissionGranted = value
+    }
 
   private data class FakeDoc(
     val docId: String,
@@ -448,7 +482,8 @@ class FakeSafTreeAdapter(
   }
 
   override fun isMediaMounted(): Boolean = mounted
-  override fun verifyPermissionGranted(): Boolean = permissionGranted
+  override fun verifyPermissionGranted(requireWrite: Boolean): Boolean =
+    readPermissionGranted && (!requireWrite || writePermissionGranted)
 
   override fun isChildDocument(parentDocumentId: String, candidateDocumentId: String): Boolean {
     val doc = docs[candidateDocumentId] ?: return false
@@ -462,20 +497,22 @@ class FakeSafTreeAdapter(
   }
 
   override fun queryChildren(parentDocumentId: String): List<SafDocumentMetadata> {
-    if (!permissionGranted) throw SecurityException("Permission revoked")
+    if (!readPermissionGranted) throw SecurityException("Read permission revoked")
     return docs.values.filter { it.parentDocId == parentDocumentId }.map { it.toMeta() }
   }
 
   override fun statDocument(documentId: String): SafDocumentMetadata? {
-    if (!permissionGranted) throw SecurityException("Permission revoked")
+    if (!readPermissionGranted) throw SecurityException("Read permission revoked")
     return docs[documentId]?.toMeta()
   }
 
   override fun readBytes(documentId: String, offset: Long, length: Int): ByteArray {
-    if (!permissionGranted) throw SecurityException("Permission revoked")
+    if (!readPermissionGranted) throw SecurityException("Read permission revoked")
+    if (offset < 0L || length <= 0) return ByteArray(0)
     val doc = docs[documentId] ?: throw StorageException(StorageError.NOT_FOUND, "Missing doc")
-    val start = offset.toInt().coerceAtMost(doc.bytes.size)
-    val end = (start + length).coerceAtMost(doc.bytes.size)
+    if (offset >= doc.bytes.size.toLong()) return ByteArray(0)
+    val start = offset.toInt()
+    val end = min(doc.bytes.size.toLong(), offset + length.toLong()).toInt()
     return doc.bytes.copyOfRange(start, end)
   }
 
@@ -485,6 +522,9 @@ class FakeSafTreeAdapter(
     mode: WriteMode,
     bytes: ByteArray,
   ): SafDocumentMetadata {
+    if (!readPermissionGranted || !writePermissionGranted) {
+      throw SecurityException("Write permission not granted")
+    }
     val existing = docs.values.firstOrNull { it.parentDocId == parentDocumentId && it.displayName == displayName }
     if (existing != null) {
       if (mode == WriteMode.CREATE_NEW) {
@@ -500,6 +540,9 @@ class FakeSafTreeAdapter(
   }
 
   override fun createDirectory(parentDocumentId: String, displayName: String): SafDocumentMetadata {
+    if (!readPermissionGranted || !writePermissionGranted) {
+      throw SecurityException("Write permission not granted")
+    }
     val id = "$rootDocumentId/dir_${nextId++}"
     val created = FakeDoc(id, parentDocumentId, displayName, isDirectory = true)
     docs[id] = created
@@ -507,6 +550,9 @@ class FakeSafTreeAdapter(
   }
 
   override fun deleteDocument(parentDocumentId: String, documentId: String, recursive: Boolean) {
+    if (!readPermissionGranted || !writePermissionGranted) {
+      throw SecurityException("Write permission not granted")
+    }
     val children = docs.values.filter { it.parentDocId == documentId }
     if (children.isNotEmpty() && !recursive) {
       throw StorageException(StorageError.DENIED, "Directory not empty")
@@ -521,6 +567,9 @@ class FakeSafTreeAdapter(
     documentId: String,
     newDisplayName: String,
   ): SafDocumentMetadata {
+    if (!readPermissionGranted || !writePermissionGranted) {
+      throw SecurityException("Write permission not granted")
+    }
     val doc = docs[documentId] ?: throw StorageException(StorageError.NOT_FOUND, "Missing source")
     if (docs.values.any { it.parentDocId == targetParentDocId && it.displayName == newDisplayName }) {
       throw StorageException(StorageError.EXISTS, "Destination exists")

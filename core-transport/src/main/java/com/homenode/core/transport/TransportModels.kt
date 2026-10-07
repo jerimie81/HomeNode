@@ -103,6 +103,25 @@ enum class TransportState {
   FAILED,
 }
 
+/**
+ * Explicitly distinguishes whether a [Transport] is backed by a real tunnel engine,
+ * an in-process simulation ([TestTransport]), or an unimplemented/stubbed native engine.
+ */
+enum class TransportImplementationStatus {
+  REAL,
+  SIMULATED,
+  UNAVAILABLE,
+}
+
+/**
+ * Explicit dependency-injection selector so test/simulation transport and production WireGuard
+ * transport cannot be accidentally confused.
+ */
+enum class TransportSelectionMode {
+  TEST_IN_PROCESS,
+  PRODUCTION_WIREGUARD,
+}
+
 sealed interface TransportError {
   val message: String
 
@@ -156,6 +175,8 @@ interface TransportStream {
  */
 interface Transport {
   val state: StateFlow<TransportState>
+  val implementationStatus: TransportImplementationStatus
+    get() = TransportImplementationStatus.REAL
   val localPublicKey: PeerPublicKey
   val localTunnelIp: TunnelIp
 

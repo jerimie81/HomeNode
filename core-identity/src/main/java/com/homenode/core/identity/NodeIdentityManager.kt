@@ -101,7 +101,23 @@ class NodeIdentityManager(
         } else {
           val pubBytes = derivePublicKeyBytes(privBytes)
           val peerId = PeerId.fromBytes(pubBytes)
-          StorageResult.Success(NodePublicIdentity(nodeId = deriveNodeId(pubBytes), publicKey = peerId))
+          val derivedNodeId = deriveNodeId(pubBytes)
+          if (hasProvisionedMarker) {
+            val markerText = runCatching { markerFile.readText() }.getOrDefault("")
+            val expectedLine = "publicKey=${peerId.base64Url}"
+            if (!markerText.contains(expectedLine)) {
+              return@useBytes StorageResult.Failure(
+                StorageError.DENIED,
+                "IdentityUnavailable: Marker public key mismatch with vault private key (fail-closed)"
+              )
+            }
+          } else {
+            // Re-persist metadata marker if missing while valid vault key is intact
+            runCatching {
+              markerFile.writeText("version=1\nnodeId=$derivedNodeId\npublicKey=${peerId.base64Url}\n")
+            }
+          }
+          StorageResult.Success(NodePublicIdentity(nodeId = derivedNodeId, publicKey = peerId))
         }
       }
     }

@@ -625,6 +625,9 @@ class CloudIdTreeBackend(
   }
 
   override fun open(path: SafePath, offset: Long, length: Long): Flow<ByteArray> = flow {
+    if (offset < 0L || length < 0L) {
+      throw StorageException(StorageError.PATH_INVALID, "Negative offset or length")
+    }
     val auth = checkAuthAndStatus()
     if (auth is StorageResult.Failure) throw StorageException(auth.error, auth.message)
     val resolved = resolveByIdHopByHop(path)
@@ -635,7 +638,8 @@ class CloudIdTreeBackend(
       throw StorageException(StorageError.UNSUPPORTED, "Google-native doc cannot be streamed as raw bytes")
     }
     val bytes = node.bytes
-    var cursor = offset.toInt().coerceAtMost(bytes.size)
+    if (offset >= bytes.size.toLong()) return@flow
+    var cursor = offset.toInt()
     val end = min(bytes.size.toLong(), if (Long.MAX_VALUE - offset < length) bytes.size.toLong() else offset + length).toInt()
     while (cursor < end) {
       currentCoroutineContext().ensureActive()
@@ -751,17 +755,31 @@ class CloudIdTreeBackend(
 
   override suspend fun delete(path: SafePath, recursive: Boolean): StorageResult<Unit> {
     if (isReadOnly) return StorageResult.Failure(StorageError.DENIED, "Cloud mount is read-only")
+    if (path.isRoot) return StorageResult.Failure(StorageError.DENIED, "Cannot delete cloud root")
     val auth = checkAuthAndStatus()
     if (auth is StorageResult.Failure) return auth
     val targetRes = resolveByIdHopByHop(path)
     if (targetRes is StorageResult.Failure) return targetRes
     val target = (targetRes as StorageResult.Success).value
-    itemsById.remove(target.itemId)
+    val children = itemsById.values.filter { it.parentItemId == target.itemId }
+    if (target.isFolder && children.isNotEmpty() && !recursive) {
+      return StorageResult.Failure(StorageError.DENIED, "Cloud folder is not empty and recursive=false")
+    }
+    removeSubtreeRecursive(target.itemId)
     return StorageResult.Success(Unit)
+  }
+
+  private fun removeSubtreeRecursive(itemId: String) {
+    val children = itemsById.values.filter { it.parentItemId == itemId }
+    for (child in children) {
+      removeSubtreeRecursive(child.itemId)
+    }
+    itemsById.remove(itemId)
   }
 
   override suspend fun move(src: SafePath, dst: SafePath): StorageResult<FileStat> {
     if (isReadOnly) return StorageResult.Failure(StorageError.DENIED, "Cloud mount is read-only")
+    if (src.isRoot || dst.isRoot) return StorageResult.Failure(StorageError.PATH_INVALID, "Cannot move root")
     val auth = checkAuthAndStatus()
     if (auth is StorageResult.Failure) return auth
     val srcRes = resolveByIdHopByHop(src)
@@ -770,6 +788,9 @@ class CloudIdTreeBackend(
     val dstParentRes = resolveByIdHopByHop(dst.parent ?: SafePath.ROOT)
     if (dstParentRes is StorageResult.Failure) return dstParentRes
     val dstParent = (dstParentRes as StorageResult.Success).value
+    if (itemsById.values.any { it.parentItemId == dstParent.itemId && it.name == dst.name }) {
+      return StorageResult.Failure(StorageError.EXISTS, "Destination already exists: $dst")
+    }
     val updated = srcNode.copy(parentItemId = dstParent.itemId, name = dst.name)
     itemsById[updated.itemId] = updated
     return StorageResult.Success(
