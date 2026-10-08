@@ -23,11 +23,9 @@ import java.security.SecureRandom
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import javax.net.ssl.HttpsURLConnection
-import kotlin.math.min
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.sync.Mutex
@@ -567,7 +565,7 @@ data class CloudItemNode(
   val name: String,
   val isFolder: Boolean,
   val mimeType: String = "application/octet-stream",
-  var bytes: ByteArray = ByteArray(0),
+  var sizeBytes: Long = 0L,
   var lastModifiedEpochMillis: Long = 1_700_000_000_000L,
 )
 
@@ -583,11 +581,38 @@ class CloudIdTreeBackend(
   private val rootFolderId: String,
   private val authCoordinator: CloudAuthCoordinator,
   override val isReadOnly: Boolean = false,
-  val enforceOneDrive320KiBChunkAlignment: Boolean = (provider == StorageProvider.ONEDRIVE),
+  uploadRegistry: CloudUploadRegistry? = null,
 ) : FileBackend {
 
   val isRestWireStubbed: Boolean = true
+  override val maxWriteSizeBytes: Long
+    get() = when (provider) {
+      StorageProvider.GOOGLE_DRIVE -> uploads.maxObjectBytes(CloudProvider.GOOGLE_DRIVE)
+      StorageProvider.ONEDRIVE -> uploads.maxObjectBytes(CloudProvider.ONEDRIVE)
+      StorageProvider.DROPBOX -> uploads.maxObjectBytes(CloudProvider.DROPBOX)
+      else -> 0L
+    }
   private val itemsById = ConcurrentHashMap<String, CloudItemNode>()
+  private val uploads = uploadRegistry ?: CloudUploadRegistry.production(
+    http = OkHttpUploadTransport(),
+    tokens = { cloudProvider ->
+      TokenProvider {
+        val storageProvider = when (cloudProvider) {
+          CloudProvider.GOOGLE_DRIVE -> StorageProvider.GOOGLE_DRIVE
+          CloudProvider.ONEDRIVE -> StorageProvider.ONEDRIVE
+          CloudProvider.DROPBOX -> StorageProvider.DROPBOX
+        }
+        when (val tokenResult = authCoordinator.getValidAccessToken(accountVaultKey, storageProvider, publicClientId)) {
+          is StorageResult.Failure -> throw UploadException.ProviderError(
+            cloudProvider,
+            if (tokenResult.error == StorageError.AUTH_REQUIRED) 401 else 503,
+            tokenResult.message,
+          )
+          is StorageResult.Success -> tokenResult.value.useBytes { String(it, Charsets.UTF_8) }
+        }
+      }
+    },
+  )
   private var nextId = 100
   var simulatedHttpStatus: Int = 200
 
@@ -660,7 +685,7 @@ class CloudIdTreeBackend(
       FileEntry(
         name = it.name,
         isDirectory = it.isFolder,
-        sizeBytes = it.bytes.size.toLong(),
+        sizeBytes = it.sizeBytes,
         lastModifiedEpochMillis = it.lastModifiedEpochMillis,
       )
     }
@@ -683,7 +708,7 @@ class CloudIdTreeBackend(
       FileStat(
         name = node.name,
         isDirectory = node.isFolder,
-        sizeBytes = node.bytes.size.toLong(),
+        sizeBytes = node.sizeBytes,
         lastModifiedEpochMillis = node.lastModifiedEpochMillis,
       )
     )
@@ -702,16 +727,7 @@ class CloudIdTreeBackend(
     if (provider == StorageProvider.GOOGLE_DRIVE && node.mimeType.startsWith("application/vnd.google-apps.")) {
       throw StorageException(StorageError.UNSUPPORTED, "Google-native doc cannot be streamed as raw bytes")
     }
-    val bytes = node.bytes
-    if (offset >= bytes.size.toLong()) return@flow
-    var cursor = offset.toInt()
-    val end = min(bytes.size.toLong(), if (Long.MAX_VALUE - offset < length) bytes.size.toLong() else offset + length).toInt()
-    while (cursor < end) {
-      currentCoroutineContext().ensureActive()
-      val next = min(end, cursor + FileBackend.CHUNK_SIZE_BYTES)
-      emit(bytes.copyOfRange(cursor, next))
-      cursor = next
-    }
+    throw StorageException(StorageError.UNAVAILABLE, "Cloud download adapter is unavailable")
   }
 
   override suspend fun write(
@@ -728,78 +744,76 @@ class CloudIdTreeBackend(
     val parentRes = resolveByIdHopByHop(path.parent ?: SafePath.ROOT)
     if (parentRes is StorageResult.Failure) return parentRes
     val parent = (parentRes as StorageResult.Success).value
-
-    val buffer = ByteArrayOutputStream()
-    val chunkSizes = mutableListOf<Int>()
-    data.collect { chunk ->
-      currentCoroutineContext().ensureActive()
-      chunkSizes.add(chunk.size)
-      buffer.write(chunk)
-    }
-    val assembled = rebufferForProviderUploadSession(buffer.toByteArray())
-    if (expectedSize != null && expectedSize != assembled.size.toLong()) {
-      return StorageResult.Failure(StorageError.PATH_INVALID, "Upload size mismatch")
-    }
-
     val existing = itemsById.values.filter { it.parentItemId == parent.itemId && it.name == path.name }
     if (existing.size > 1) {
       return StorageResult.Failure(StorageError.DUPLICATE_NAME, "Duplicate target '${path.name}'")
     }
-    val node = if (existing.isNotEmpty()) {
-      if (mode == WriteMode.CREATE_NEW) {
-        return StorageResult.Failure(StorageError.EXISTS, "Cloud file already exists")
-      }
-      existing.first().also { it.bytes = assembled }
-    } else {
-      val id = "${provider.name.lowercase()}_${nextId++}"
-      CloudItemNode(
-        itemId = id,
-        parentItemId = parent.itemId,
-        name = path.name,
-        isFolder = false,
-        bytes = assembled,
-      ).also { itemsById[id] = it }
+    val oldItem = existing.singleOrNull()
+    if (oldItem?.isFolder == true) {
+      return StorageResult.Failure(StorageError.PATH_INVALID, "Cannot replace a cloud folder with a file")
     }
+    if (mode == WriteMode.CREATE_NEW && oldItem != null) {
+      return StorageResult.Failure(StorageError.EXISTS, "Cloud file already exists")
+    }
+    val cloudProvider = when (provider) {
+      StorageProvider.GOOGLE_DRIVE -> CloudProvider.GOOGLE_DRIVE
+      StorageProvider.ONEDRIVE -> CloudProvider.ONEDRIVE
+      StorageProvider.DROPBOX -> CloudProvider.DROPBOX
+      else -> return StorageResult.Failure(StorageError.UNSUPPORTED, "Not a cloud provider: $provider")
+    }
+    val remotePath = "/" + path.segments.joinToString("/")
+    val remote = try {
+      uploads.uploaderFor(cloudProvider).upload(
+        target = UploadTarget(
+          parentId = parent.itemId,
+          name = path.name,
+          existingId = oldItem?.itemId,
+          remotePath = remotePath,
+          allowReplace = mode == WriteMode.OVERWRITE,
+        ),
+        expectedSize = expectedSize,
+        body = data,
+      )
+    } catch (ce: CancellationException) {
+      throw ce
+    } catch (ue: UploadException.QuotaExceeded) {
+      return StorageResult.Failure(StorageError.QUOTA, ue.message ?: "Cloud upload exceeds provider quota")
+    } catch (ue: UploadException.SizeMismatch) {
+      return StorageResult.Failure(StorageError.PATH_INVALID, ue.message ?: "Cloud upload size mismatch")
+    } catch (ue: UploadException.SizeRequired) {
+      return StorageResult.Failure(StorageError.PATH_INVALID, ue.message ?: "Cloud provider requires expected size")
+    } catch (ue: UploadException.ProviderUnavailable) {
+      return StorageResult.Failure(StorageError.UNAVAILABLE, ue.message ?: "Cloud upload adapter unavailable")
+    } catch (ue: UploadException.ProviderError) {
+      val error = when (ue.status) {
+        401 -> StorageError.AUTH_REQUIRED
+        403 -> StorageError.DENIED
+        429 -> StorageError.RATE_LIMITED
+        in 500..599 -> StorageError.UNAVAILABLE
+        else -> StorageError.INTERNAL
+      }
+      return StorageResult.Failure(error, ue.message ?: "Cloud provider upload failed")
+    } catch (e: Exception) {
+      return StorageResult.Failure(StorageError.UNAVAILABLE, "Cloud upload failed")
+    }
+    val node = CloudItemNode(
+      itemId = remote.id,
+      parentItemId = parent.itemId,
+      name = remote.name.ifBlank { path.name },
+      isFolder = false,
+      sizeBytes = remote.size,
+    )
+    oldItem?.let { itemsById.remove(it.itemId, it) }
+    itemsById[node.itemId] = node
 
     return StorageResult.Success(
       FileStat(
         name = node.name,
         isDirectory = false,
-        sizeBytes = node.bytes.size.toLong(),
+        sizeBytes = node.sizeBytes,
         lastModifiedEpochMillis = node.lastModifiedEpochMillis,
       )
     )
-  }
-
-  /**
-   * Ensures OneDrive Graph upload session chunks are sliced in 320 KiB (`327_680` byte) multiples (§8.8).
-   */
-  internal fun sliceForOneDriveUploadSession(raw: ByteArray): List<ByteArray> {
-    val unit = ONEDRIVE_CHUNK_ALIGNMENT_BYTES
-    if (raw.isEmpty()) return listOf(ByteArray(0))
-    val slices = mutableListOf<ByteArray>()
-    var offset = 0
-    while (offset < raw.size) {
-      val end = min(raw.size, offset + unit)
-      slices.add(raw.copyOfRange(offset, end))
-      offset = end
-    }
-    return slices
-  }
-
-  private fun rebufferForProviderUploadSession(raw: ByteArray): ByteArray {
-    if (!enforceOneDrive320KiBChunkAlignment) return raw
-    val slices = sliceForOneDriveUploadSession(raw)
-    val out = ByteArrayOutputStream(raw.size)
-    for ((idx, slice) in slices.withIndex()) {
-      if (idx < slices.lastIndex) {
-        check(slice.size % ONEDRIVE_CHUNK_ALIGNMENT_BYTES == 0) {
-          "OneDrive intermediate chunk must be a multiple of 320 KiB"
-        }
-      }
-      out.write(slice)
-    }
-    return out.toByteArray()
   }
 
   override suspend fun mkdir(path: SafePath): StorageResult<FileStat> {
@@ -859,11 +873,10 @@ class CloudIdTreeBackend(
     val updated = srcNode.copy(parentItemId = dstParent.itemId, name = dst.name)
     itemsById[updated.itemId] = updated
     return StorageResult.Success(
-      FileStat(updated.name, updated.isFolder, updated.bytes.size.toLong(), updated.lastModifiedEpochMillis)
+      FileStat(updated.name, updated.isFolder, updated.sizeBytes, updated.lastModifiedEpochMillis)
     )
   }
 
   companion object {
-    const val ONEDRIVE_CHUNK_ALIGNMENT_BYTES = 320 * 1024 // 320 KiB exact alignment required by Microsoft Graph (§8.8)
   }
 }

@@ -14,6 +14,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -279,22 +280,36 @@ class CloudAuthAndBackendsTest {
     assertEquals(StorageError.RATE_LIMITED, (drive.list(PathValidator.parseRelative("").getOrThrow()) as StorageResult.Failure).error)
     drive.simulatedHttpStatus = 200
 
-    // OneDrive 320 KiB upload chunk alignment verification
+    // OneDrive 320 KiB upload session behavior is covered by OneDriveAdapterTest.
     val oneDrive = CloudIdTreeBackend(
       provider = StorageProvider.ONEDRIVE,
       accountVaultKey = key,
       publicClientId = clientId,
       rootFolderId = "od_root",
       authCoordinator = auth,
+      uploadRegistry = CloudUploadRegistry(mapOf(
+        CloudProvider.ONEDRIVE to InMemoryUploadAdapter(provider = CloudProvider.ONEDRIVE),
+      )),
     )
     val payload700KiB = ByteArray(700 * 1024) { (it and 0x7F).toByte() }
-    val slices = oneDrive.sliceForOneDriveUploadSession(payload700KiB)
-    assertEquals(3, slices.size)
-    assertEquals(320 * 1024, slices[0].size)
-    assertEquals(320 * 1024, slices[1].size)
-    assertEquals(60 * 1024, slices[2].size)
-
     val odFile = PathValidator.parseRelative("backup.tar").getOrThrow()
     assertTrue(oneDrive.write(odFile, WriteMode.OVERWRITE, flowOf(payload700KiB), payload700KiB.size.toLong()).isSuccess)
+    assertEquals(payload700KiB.size.toLong(), oneDrive.stat(odFile).getOrThrow().sizeBytes)
+
+    val unavailableBackend = CloudIdTreeBackend(
+      provider = StorageProvider.DROPBOX,
+      accountVaultKey = key,
+      publicClientId = clientId,
+      rootFolderId = "db_root",
+      authCoordinator = auth,
+      uploadRegistry = CloudUploadRegistry(emptyMap()),
+    )
+    val unavailableWrite = unavailableBackend.write(
+      PathValidator.parseRelative("no-adapter.bin").getOrThrow(),
+      WriteMode.CREATE_NEW,
+      flow { error("Fail-closed registry must reject before reading the request body") },
+      1L,
+    )
+    assertEquals(StorageError.UNAVAILABLE, (unavailableWrite as StorageResult.Failure).error)
   }
 }

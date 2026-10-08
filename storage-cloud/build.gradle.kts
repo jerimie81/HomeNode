@@ -1,5 +1,6 @@
 plugins {
   alias(libs.plugins.android.library)
+  alias(libs.plugins.ktlint)
 }
 
 android {
@@ -20,6 +21,9 @@ android {
 dependencies {
   implementation(project(":core-storage"))
   implementation(libs.kotlinx.coroutines.core)
+  implementation(libs.kotlinx.serialization.json)
+  implementation(libs.okhttp)
   testImplementation(libs.junit)
+  testImplementation("org.jetbrains.kotlin:kotlin-test-junit:2.2.10")
   testImplementation(libs.kotlinx.coroutines.test)
 }

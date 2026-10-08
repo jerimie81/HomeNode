@@ -8,6 +8,9 @@ import kotlinx.coroutines.flow.Flow
  */
 interface FileBackend {
   val isReadOnly: Boolean
+  /** Maximum accepted object size for this backend; streamed implementations should enforce it while writing. */
+  val maxWriteSizeBytes: Long
+    get() = MAX_WRITE_SIZE_BYTES
 
   suspend fun list(
     path: SafePath,
@@ -40,6 +43,6 @@ interface FileBackend {
     const val CHUNK_SIZE_BYTES: Int = 64 * 1024 // 64 KiB streaming chunk bound (§2, §8.3)
     const val DEFAULT_PAGE_SIZE: Int = 100
     const val MAX_PAGE_SIZE: Int = 500
-    const val MAX_WRITE_SIZE_BYTES: Long = 2L * 1024L * 1024L * 1024L // 2 GiB cap per stream
+    const val MAX_WRITE_SIZE_BYTES: Long = 2L * 1024L * 1024L * 1024L // Default in-memory backend safety cap
   }
 }

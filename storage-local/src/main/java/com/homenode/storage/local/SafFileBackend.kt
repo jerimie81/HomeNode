@@ -83,6 +83,7 @@ class SafFileBackend(
   private val listingCacheTtlMs: Long = LISTING_CACHE_TTL_MS,
   private val clockEpochMillis: () -> Long = { System.currentTimeMillis() },
 ) : FileBackend {
+  override val maxWriteSizeBytes: Long = SAF_MAX_WRITE_SIZE_BYTES
 
   val isSimulatedAdapter: Boolean
     get() = adapter.isSimulated

@@ -351,10 +351,6 @@ class FileService(
       sendError(stream, requestId, StorageError.PATH_INVALID.name, "Negative expectedSize is forbidden")
       return
     }
-    if (req.expectedSize > FileBackend.MAX_WRITE_SIZE_BYTES) {
-      sendError(stream, requestId, StorageError.QUOTA.name, "Write expectedSize exceeds 2 GiB maximum")
-      return
-    }
     val vpRes = PathValidator.parseVirtualPath(req.virtualPath)
     if (vpRes is StorageResult.Failure) {
       sendStorageFailure(stream, requestId, vpRes)
@@ -366,6 +362,10 @@ class FileService(
       return
     }
     val backend = authorizeAndResolveBackend(stream, peerId, requestId, mountId, AccessMode.WRITE) ?: return
+    if (req.expectedSize > backend.maxWriteSizeBytes) {
+      sendError(stream, requestId, StorageError.QUOTA.name, "Write expectedSize exceeds backend quota")
+      return
+    }
 
     var receivedBytes = 0L
     val dataFlow = flow {
@@ -396,10 +396,10 @@ class FileService(
         }
         when (nextFrame.type) {
           FrameType.DATA -> {
-            receivedBytes += nextFrame.payload.size
-            if (receivedBytes > FileBackend.MAX_WRITE_SIZE_BYTES) {
-              throw StorageException(StorageError.QUOTA, "Stream exceeded max write size")
+            if (nextFrame.payload.size.toLong() > backend.maxWriteSizeBytes - receivedBytes) {
+              throw StorageException(StorageError.QUOTA, "Stream exceeded backend write quota")
             }
+            receivedBytes += nextFrame.payload.size
             if (receivedBytes > req.expectedSize) {
               throw StorageException(StorageError.PATH_INVALID, "Streamed bytes exceeded expectedSize")
             }

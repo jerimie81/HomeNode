@@ -88,7 +88,7 @@ class MountManager(
           warnings.add("Mount '/${mount.id.value}' (${mount.label}): SFTP wire adapter stubbed")
         }
         is CloudIdTreeBackend -> if (backend.isRestWireStubbed) {
-          warnings.add("Mount '/${mount.id.value}' (${mount.label}): CloudIdTreeBackend REST wire adapter stubbed")
+          warnings.add("Mount '/${mount.id.value}' (${mount.label}): cloud list/read/stat REST adapters stubbed; writes use provider upload sessions")
         }
       }
     }

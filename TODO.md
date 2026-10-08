@@ -31,12 +31,14 @@ Do not present HomeNode as a usable P2P storage node until every P0 item below i
 
 ## P0 — make writes bounded and genuinely streaming
 
-- [ ] Remove full-object buffering from `CloudIdTreeBackend.write` and `SafFileBackend.write`.
+- [x] Remove full-object buffering from `CloudIdTreeBackend.write` and `SafFileBackend.write`.
   - Do not use `ByteArrayOutputStream` for peer-provided file bodies.
   - [x] Stream SAF writes to a temporary sibling document, count bytes while writing, verify `expectedSize`, enforce a 512 MiB SAF quota, then replace through provider rename with rollback. Clean up partial output on cancellation or failure.
-  - [ ] Stream cloud writes through provider upload sessions; emit OneDrive-compliant 320 KiB chunks without assembling the object in memory.
-  - Replace the generic 2 GiB in-memory allowance with backend-specific quotas that fit the device/storage provider and reject excess data before allocation.
-  - Test multi-chunk files, quota rejection, cancellation, size mismatch, out-of-space/provider failure, cleanup, and atomic replacement semantics.
+  - [x] Stream cloud writes through provider upload sessions; emit OneDrive-compliant 320 KiB non-final chunks without assembling the object in memory. Adapters fail closed when absent.
+  - [x] Replace the generic 2 GiB limit in the file service with backend-specific quotas (SAF 512 MiB; cloud provider limits; in-memory backend retains its own 2 GiB cap).
+  - [x] Add tests for multi-chunk, quota rejection, cancellation, size mismatch, cleanup, and atomic replacement semantics. Tests are authored but not compiled or run.
+  - [ ] Add Google Drive and Dropbox wire-level failure/abort tests; implement retry/backoff and resumable recovery for transient failures.
+  - [ ] Cap peer-supplied transport DATA frame size before materializing flow chunks; current protocol frame limit is 1 MiB.
 
 ## P0 — restore reproducible builds and test execution
 
@@ -89,10 +91,11 @@ Do not present HomeNode as a usable P2P storage node until every P0 item below i
 
 ## Quality gates
 
-- [ ] Remove template tests and replace them with behavior tests relevant to HomeNode.
-- [ ] Add a CI workflow that runs formatting/static analysis, unit tests, dependency verification/locking, and a clean debug build.
+- [x] Remove generic example arithmetic and app-context tests; retain behavior-focused Robolectric, architecture, and module tests. Cloud upload tests are authored but not yet executed.
+- [x] Expand CI to run Kotlin formatting, Android lint, unit tests, dependency lock/checksum generation, and clean debug assembly. First green run remains required.
+- [ ] Check in generated dependency lockfiles and Gradle verification metadata after a successful trusted dependency-resolution run.
 - [ ] Perform an Android-device validation run for API 28 and a currently supported Android version before any release candidate.
-- [ ] Update `STATUS.md` and ADRs to distinguish verified production capabilities from simulations/stubs after each completed slice.
+- [x] Update `STATUS.md` to distinguish implemented upload slices from unverified tests and simulated/unavailable cloud operations. ADR review remains pending where architecture decisions change.
 
 ## Implementation status — 2026-10-07
 
@@ -104,6 +107,7 @@ Completed in this pass:
 - LAN discovery excludes the node's current RFC1918 addresses before mDNS results are returned or TCP probes are opened.
 - The façade no longer fabricates a remote pairing key. It now exposes `completePairingFromScannedResponse`, which requires a remotely scanned response and rolls authorization back if transport peer configuration fails.
 - SAF writes now stream to sibling staging documents and commit after size verification; replacement uses provider rename with rollback and cleans up failed staging files.
+- Cloud writes now use OneDrive, Google Drive, or Dropbox upload sessions through a bounded chunk buffer and production HTTP transport. `CloudIdTreeBackend` no longer retains uploaded bodies; it installs item metadata after provider commit. Cloud download/read and remote tree metadata operations remain simulated or unavailable.
 - Pending OAuth PKCE requests are capped at eight and expire after five minutes; expired verifiers are closed.
 - Transport construction now waits for the persisted identity and verifies the transport public key; real WireGuard private-key binding remains blocked on the engine implementation.
 
@@ -111,6 +115,8 @@ Verification completed:
 
 - `git diff --check` passes.
 - `test -x gradlew` passes.
+
+Cloud upload follow-up: provider tests and backend integration tests are authored but not run because no Kotlin/Gradle toolchain is available in this environment. Next target is real cloud list/read/stat/mkdir/delete/move and persisted remote metadata; keep production capability claims gated until compilation, tests, and provider sandbox validation pass.
 
 Test blocker to resolve before claiming test success:
 
