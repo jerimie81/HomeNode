@@ -126,6 +126,7 @@ class NodeIdentityManager(
     return@withLock generateAndPersistNewIdentityLocked()
   }
 
+
   /**
    * Explicit, warned user action to regenerate node identity when Keystore is invalidated (§4).
    */

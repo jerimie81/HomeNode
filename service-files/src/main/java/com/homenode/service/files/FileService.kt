@@ -95,6 +95,16 @@ class FileService(
         }
 
         val frame = (decoded as CodecResult.Success).value
+        if (frame.type == FrameType.WRITE && frame.payload.size > MAX_WRITE_DATA_FRAME_BYTES) {
+          sendError(
+            stream,
+            frame.requestId,
+            "FRAME_TOO_LARGE",
+            "WRITE metadata frame exceeds $MAX_WRITE_DATA_FRAME_BYTES-byte cap",
+          )
+          stream.close()
+          return
+        }
         if (!helloCompleted) {
           if (frame.type != FrameType.HELLO) {
             sendError(stream, frame.requestId, "BAD_REQUEST", "First frame must be HELLO")
@@ -381,6 +391,12 @@ class FileService(
         if (nextFrame.requestId != requestId) {
           throw StorageException(StorageError.PATH_INVALID, "Mismatched requestId on WRITE stream frame")
         }
+        if (nextFrame.type == FrameType.DATA && nextFrame.payload.size > MAX_WRITE_DATA_FRAME_BYTES) {
+          throw StorageException(
+            StorageError.PATH_INVALID,
+            "WRITE DATA frame exceeds $MAX_WRITE_DATA_FRAME_BYTES-byte limit",
+          )
+        }
         // Re-check peer authorization and mount writability during streaming write
         if (!authorizer.can(peerId, Capability.Files(mountId, AccessMode.WRITE))) {
           onRequestDeniedAudit()
@@ -571,6 +587,8 @@ class FileService(
   }
 
   companion object {
+    /** Bounds each untrusted data frame before the backend/uploader observes it. */
+    const val MAX_WRITE_DATA_FRAME_BYTES = 64 * 1024
     const val FILE_SERVICE_PORT = 7001
     const val MAX_VIOLATIONS_PER_STREAM = 3
   }

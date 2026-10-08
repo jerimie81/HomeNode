@@ -7,9 +7,10 @@
 - Pending OAuth PKCE requests are capped at eight and expire after five minutes; abandoned verifiers are closed. A behavior test covers capacity and expiry.
 - SAF writes stream into a temporary sibling, enforce a 512 MiB backend quota, verify expected size, and commit via provider rename with rollback; failure and cancellation paths clean up staging files. A host test covers chunked success, mismatch preservation, and quota rejection.
 - Cloud writes now stream through bounded upload-session adapters for OneDrive, Google Drive, and Dropbox; `CloudIdTreeBackend` no longer stores complete file bodies. Providers fail closed when no adapter is configured. Cloud read/download and remote tree metadata operations remain simulated or unavailable.
-- FileService enforces the selected backend's write quota; the transport currently caps DATA frames at 1 MiB.
+- FileService enforces the selected backend's write quota and rejects WRITE DATA payloads over 64 KiB before backend delivery.
 - Cloud uploader and integration tests are authored, but no Kotlin compilation, Gradle tests, or device/provider validation has run. `git diff --check` is the only verification for this update.
 - Quality-gate setup now removes the generic arithmetic/app-context example tests and retains behavior tests; CI is configured for ktlint, Android lint, unit tests, dependency lock/checksum generation, and clean debug assembly. This workflow has not been executed, generated dependency metadata is not committed, and no physical API 28/current device validation was available.
+- P0 hardening adds Google Drive/Dropbox upload failure cleanup tests. Pairing requires a scanned remote key and node-issued one-time token. Production WireGuard/private-key binding remains unavailable because the engine is still a stub; the ignored JDK 25 daemon pin remains local, and Gradle help stalled during configuration, so no build/test result is claimed.
 
 Truthfulness vocabulary: `implemented · tested · partial · stubbed · blocked`.
 *(Per `1_AGENT_CONFIG.md` §1 & §6: items are marked `implemented`, `partial`, or `stubbed` until you paste physical S8+ / machine verification output to promote them to `tested`.)*

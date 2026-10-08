@@ -48,6 +48,7 @@ internal class IdentityBoundTransport(
     delegate = created
   }
 
+
   private fun current(): Transport? = delegate
 
   private fun unavailable(): TransportResult.Failure = TransportResult.Failure(

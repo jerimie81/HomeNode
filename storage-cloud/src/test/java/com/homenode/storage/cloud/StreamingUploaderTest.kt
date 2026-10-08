@@ -200,6 +200,25 @@ class OneDriveAdapterTest {
 }
 
 class GoogleDriveAdapterTest {
+    @Test fun appendFailureAbortsResumableSessionAndDoesNotCommit() = runTest {
+        val http = FakeHttp { request ->
+            when {
+                request.method == "GET" -> HttpResponse(200, body = """{"files":[]}""".toByteArray())
+                request.method == "POST" -> HttpResponse(200, mapOf("location" to "https://upload.example/g-fail"))
+                request.method == "DELETE" -> HttpResponse(204)
+                else -> HttpResponse(500, body = "server error".toByteArray())
+            }
+        }
+        assertFailsWith<UploadException.ProviderError> {
+            StreamingUploader(GoogleDriveUploadAdapter(http, TokenProvider { "tok" })).upload(
+                UploadTarget("root", "fail.bin"),
+                8L * 1024 * 1024 + 1,
+                flow { emit(ByteArray(8 * 1024 * 1024 + 1)) },
+            )
+        }
+        assertEquals(listOf("GET", "POST", "PUT", "DELETE"), http.seen.map { it.method })
+    }
+
     @Test fun resumableChunksUseAlignedRangesAndCommitOnlyAtFinish() = runTest {
         val http = FakeHttp { request ->
             when {
@@ -241,6 +260,24 @@ class GoogleDriveAdapterTest {
 }
 
 class DropboxAdapterTest {
+    @Test fun appendFailureDropsSessionWithoutCallingFinish() = runTest {
+        val http = FakeHttp { request ->
+            when {
+                request.url.endsWith("upload_session/start") -> HttpResponse(200, body = """{"session_id":"s-fail"}""".toByteArray())
+                request.url.endsWith("upload_session/append_v2") -> HttpResponse(503, body = "temporarily unavailable".toByteArray())
+                else -> error("finish must not be called after append failure")
+            }
+        }
+        assertFailsWith<UploadException.ProviderError> {
+            StreamingUploader(DropboxUploadAdapter(http, TokenProvider { "tok" })).upload(
+                UploadTarget("root", "fail.bin", remotePath = "/fail.bin"),
+                null,
+                flow { emit(ByteArray(16 * 1024 * 1024)) },
+            )
+        }
+        assertEquals(listOf("upload_session/start", "upload_session/append_v2"), http.seen.map { it.url.substringAfterLast("/files/") })
+    }
+
     @Test fun uploadSessionUsesRemotePathAndOverwriteAtCommit() = runTest {
         val http = FakeHttp { request ->
             when {

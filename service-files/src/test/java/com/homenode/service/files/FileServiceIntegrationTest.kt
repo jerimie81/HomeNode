@@ -617,10 +617,32 @@ class FileServiceIntegrationTest {
       (ProtocolV2PayloadCodec.decodeError(timeoutErr.payload) as CodecResult.Success).value.errorCode
     )
 
+    // A DATA frame over the streaming ingress cap is rejected before reaching the backend.
+    val partialPath = "/${mountId.value}/partial.bin"
+    val oversizedDataStream = peerTransport.openStream(nodeKey, FileService.FILE_SERVICE_PORT).getOrThrow()
+    negotiateHello(oversizedDataStream)
+    oversizedDataStream.writeFrameBytes(
+      FrameCodec.encodeFrame(
+        WireFrame(
+          FrameType.WRITE,
+          0,
+          175,
+          ProtocolV2PayloadCodec.encodeWriteReq(ProtocolMessage.WriteReq(partialPath, WriteMode.CREATE_NEW, 100_000L)),
+        ),
+      ),
+    )
+    oversizedDataStream.writeFrameBytes(
+      FrameCodec.encodeFrame(
+        WireFrame(FrameType.DATA, 0, 175, ByteArray(FileService.MAX_WRITE_DATA_FRAME_BYTES + 1)),
+      ),
+    )
+    val oversizedWriteErr = (FrameCodec.decodeFrame(oversizedDataStream.readFrameBytes(65536).getOrThrow()!!) as CodecResult.Success).value
+    assertEquals(FrameType.ERROR, oversizedWriteErr.type)
+    oversizedDataStream.close()
+
     // 4. Truncated WRITE (stream closed before END) must not commit partial file
     val truncStream = peerTransport.openStream(nodeKey, FileService.FILE_SERVICE_PORT).getOrThrow()
     negotiateHello(truncStream)
-    val partialPath = "/${mountId.value}/partial.bin"
     truncStream.writeFrameBytes(
       FrameCodec.encodeFrame(
         WireFrame(

@@ -9,21 +9,22 @@ Do not present HomeNode as a usable P2P storage node until every P0 item below i
 - [ ] Replace `HomeNodeFacade.pairNewDeviceModeA`'s locally manufactured peer with a real pairing flow.
   - [x] Removed locally generated remote-key pairing; the invitation action now only generates an invitation and cannot report a fake successful pairing.
   - [x] Added a scanned-response completion entry point that consumes the node-issued token, registers the scanned remote public key, and rolls authorization back if transport peer setup fails.
-  - The node produces its own short-lived QR; a remote device scans it and returns a payload containing *its own* public key and the node-issued one-time token.
-  - Require explicit local user confirmation of the remote peer label and selected capabilities before registration.
-  - Validate the token atomically, consume it exactly once, enforce TTL and failed-attempt limits, and bind the peer identity to the scanned remote public key.
-  - Never create a remote key locally or report a peer as paired until its authenticated key has been registered.
-  - Add the registered peer to the active transport with the allocated `/32`; on revocation, remove the peer and tear down its streams.
-  - Add integration tests for success, replay, expiry, token mismatch, wrong public key, rejected confirmation, and revocation teardown.
+  - [x] Node issues a short-lived QR; scanned response carries the remote device public key and node-issued one-time token.
+  - [x] Require explicit local confirmation of peer label and selected capabilities before registration.
+  - [x] Consume token exactly once; enforce TTL and failed-attempt limits; bind identity to scanned remote public key.
+  - [x] Never create a remote key locally or report successful pairing before registration.
+  - [x] Register transport peer with allocated `/32`; revocation removes peer from transport.
+  - [ ] Add full integration coverage for replay, expiry, token mismatch, confirmation rejection, and revocation stream teardown.
 
-- [ ] Bind the transport static key to `NodeIdentityManager`'s persisted X25519 identity.
+- [x] Bind the transport public identity to `NodeIdentityManager`'s persisted X25519 identity before construction/start.
   - [x] Do not construct a transport from `generateEphemeralKeypair()` during `HomeNodeFacade` initialization.
   - [x] Load or initialize identity before constructing/starting the selected transport.
-  - [ ] Give the real WireGuard engine the matching protected private key without exposing it outside `CredentialVault`.
+  - [ ] Give a real WireGuard engine the matching protected private key without exposing it outside `CredentialVault` (blocked: no production engine exists).
   - [ ] Assert that the public key advertised in pairing QR, the peer-authorizer identity, and the WireGuard static public key are byte-for-byte identical. Runtime identity-to-transport public-key equality is covered; QR and engine equality are not.
   - Keep private key bytes inside `CredentialVault`/keystore boundaries; zero temporary buffers.
 
 - [ ] Implement a real production transport behind `WireGuardEngine`.
+  - [ ] This remains blocked: only `UserspaceWireGuardEngineStub` exists; no production engine dependency/netstack is present. Do not report production transport as implemented.
   - Complete the ADR-001 hardware spike first, choose the supported WireGuard userspace/netstack integration, and implement interface lifecycle, peer configuration, stream dialing, and inbound stream delivery.
   - Preserve strict one-peer-to-one-`/32` routing and reject wildcard `AllowedIPs`.
   - Keep `TestTransport` test-only and make production construction fail closed when the real engine is unavailable.
@@ -37,17 +38,17 @@ Do not present HomeNode as a usable P2P storage node until every P0 item below i
   - [x] Stream cloud writes through provider upload sessions; emit OneDrive-compliant 320 KiB non-final chunks without assembling the object in memory. Adapters fail closed when absent.
   - [x] Replace the generic 2 GiB limit in the file service with backend-specific quotas (SAF 512 MiB; cloud provider limits; in-memory backend retains its own 2 GiB cap).
   - [x] Add tests for multi-chunk, quota rejection, cancellation, size mismatch, cleanup, and atomic replacement semantics. Tests are authored but not compiled or run.
-  - [ ] Add Google Drive and Dropbox wire-level failure/abort tests; implement retry/backoff and resumable recovery for transient failures.
-  - [ ] Cap peer-supplied transport DATA frame size before materializing flow chunks; current protocol frame limit is 1 MiB.
+  - [x] Add Google Drive and Dropbox append-failure cleanup tests; retry/backoff and resumable recovery for transient failures remain.
+  - [x] Reject peer WRITE DATA frames larger than 64 KiB before emitting payloads to the backend/uploader.
 
 ## P0 — restore reproducible builds and test execution
 
 - [ ] Fix the committed Gradle wrapper and isolate local tooling artifacts.
   - [x] Commit `gradlew` with executable mode `100755`; retain `gradlew.bat` as a normal Windows file.
-  - Restore the intended wrapper version and its `networkTimeout`/distribution validation settings, or upgrade wrapper and AGP together in one tested change.
-  - Do not commit `gradle/gradle-daemon-jvm.properties` unless the repository intentionally requires that exact JDK and a working pinned toolchain URL. Prefer a documented, installed JDK compatible with CI and development hosts.
+  - [x] Wrapper targets Gradle 9.8 and wrapper script/JAR are present. `./gradlew --no-daemon help` reached configuration but stalled resolving/configuring plugins and was stopped; no clean build verification yet.
+  - [ ] Align the ignored, machine-local JDK 25 daemon pin with a documented/project-supported JDK; this host has JDK 21. Do not modify or commit the ignored pin without confirming project intent.
   - [x] Add `.gitignore` rules for `.idea/`, `**/build/`, `*.zip`, extracted Gradle distributions, logs, and other machine-local files. Keep only deliberate shared IDE configuration if explicitly approved.
-  - Validate from a clean checkout: `./gradlew --no-daemon test`, debug assembly, and dependency resolution without relying on untracked files.
+  - [ ] Validate from a clean checkout: `./gradlew --no-daemon test`, debug assembly, and dependency resolution without relying on untracked files.
 
 ## P1 — lifecycle, persistence, and network hardening
 
