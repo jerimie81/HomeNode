@@ -192,11 +192,13 @@ class CoreIdentityTest {
     val now = 5_000_000L
     val authorizer = PeerAuthorizer { now }
     val coordinator = ModeAPairingCoordinator(authorizer) { now }
-    val (_, pubKey) = NodeIdentityManager.generateEphemeralKeypair()
-    val identity = NodePublicIdentity("hn_node01", pubKey)
+    val (_, nodePublicKey) = NodeIdentityManager.generateEphemeralKeypair()
+    val (_, remotePublicKey) = NodeIdentityManager.generateEphemeralKeypair()
+    val identity = NodePublicIdentity("hn_node01", nodePublicKey)
 
     val qrPayload = coordinator.createNodeIntroductionQr(identity, listOf("192.168.1.10:51820"))
-    val uri = PairingPayloadParser.formatUri(qrPayload)
+    // A real response preserves the node-issued token but identifies the remote device, not the node.
+    val uri = PairingPayloadParser.formatUri(qrPayload.copy(publicKey = remotePublicKey))
 
     // First use succeeds
     val mountId = MountId.generate()
@@ -206,6 +208,7 @@ class CoreIdentityTest {
       userSelectedCapabilities = setOf(Capability.Files(mountId, AccessMode.READ)),
     )
     assertTrue(firstConfirm.isSuccess)
+    assertEquals(remotePublicKey, (firstConfirm as PairingResult.Success).value.peerId)
 
     // Replay of same QR must fail (single-use token consumed)
     val replayConfirm = coordinator.confirmPeerFromScannedQr(

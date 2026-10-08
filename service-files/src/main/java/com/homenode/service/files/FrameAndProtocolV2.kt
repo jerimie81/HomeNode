@@ -123,7 +123,7 @@ object ProtocolV2PayloadCodec {
     if (len > maxBytes) throw IllegalArgumentException("String length $len > $maxBytes")
     val bytes = ByteArray(len)
     readFully(bytes)
-    return bytes.decodeToString()
+    return bytes.decodeToString(throwOnInvalidSequence = true)
   }
 
   fun encodeHello(msg: ProtocolMessage.Hello): ByteArray = buildBytes {
@@ -289,7 +289,13 @@ object ProtocolV2PayloadCodec {
 
   private inline fun <T> readBytes(bytes: ByteArray, block: DataInputStream.() -> T): CodecResult<T> {
     return try {
-      DataInputStream(ByteArrayInputStream(bytes)).use { CodecResult.Success(it.block()) }
+      DataInputStream(ByteArrayInputStream(bytes)).use {
+        val decoded = it.block()
+        if (it.available() != 0) {
+          throw IllegalArgumentException("Trailing bytes after protocol payload")
+        }
+        CodecResult.Success(decoded)
+      }
     } catch (e: Exception) {
       CodecResult.Malformed("BAD_REQUEST", "Malformed message payload")
     }

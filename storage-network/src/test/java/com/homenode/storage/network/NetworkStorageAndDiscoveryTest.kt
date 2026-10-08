@@ -141,4 +141,38 @@ class NetworkStorageAndDiscoveryTest {
       (discovery.scanLanForStorage("192.168.1", userInitiatedInForeground = true) as StorageResult.Failure).error
     )
   }
+
+  @Test
+  fun networkDiscovery_neverProbesOrReturnsOwnInterfaceAddress() = runTest {
+    val probedHosts = mutableListOf<String>()
+    val discovery = NetworkDiscovery(
+      mdnsSource = object : MdnsDiscoverySource {
+        override suspend fun queryMdnsServices() = listOf(
+          DiscoveredService(
+            hostIp = "192.168.1.2",
+            port = 445,
+            protocolGuess = StorageProvider.SMB,
+            advertisedName = "This device",
+            source = DiscoverySource.MDNS,
+          )
+        )
+      },
+      portProber = object : TcpPortProber {
+        override suspend fun isPortOpen(hostIp: String, port: Int, timeoutMs: Int): Boolean {
+          probedHosts += hostIp
+          return true
+        }
+      },
+      ownInterfaceIpsProvider = { setOf("192.168.1.2") },
+    )
+
+    val results = discovery.scanLanForStorage(
+      subnetPrefix24 = "192.168.1",
+      userInitiatedInForeground = true,
+      portsToProbe = listOf(445),
+      maxHostsToProbe = 2,
+    ).getOrThrow()
+    assertFalse(probedHosts.contains("192.168.1.2"))
+    assertFalse(results.any { it.hostIp == "192.168.1.2" })
+  }
 }

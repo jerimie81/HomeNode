@@ -1,6 +1,8 @@
 *.iml
 .gradle
 .kotlin
+.idea/
+!.idea/.gitignore
 /local.properties
 /.idea/caches
 /.idea/libraries
@@ -16,3 +18,10 @@
 local.properties
 .env
 debug.keystore
+
+# Generated build/tooling artifacts
+**/build/
+*.zip
+gradle-[0-9]*/
+*.out
+gradle/gradle-daemon-jvm.properties

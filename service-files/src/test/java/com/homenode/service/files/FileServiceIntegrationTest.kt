@@ -192,6 +192,15 @@ class FileServiceIntegrationTest {
   }
 
   @Test
+  fun payloadCodec_rejectsTrailingBytes() {
+    val hello = ProtocolV2PayloadCodec.encodeHello(ProtocolMessage.Hello(2, 4096))
+    assertTrue(ProtocolV2PayloadCodec.decodeHello(hello + byteArrayOf(0x7f)).let { it is CodecResult.Malformed })
+
+    val stat = ProtocolV2PayloadCodec.encodeStatReq(ProtocolMessage.StatReq("/mount_a/file.txt"))
+    assertTrue(ProtocolV2PayloadCodec.decodeStatReq(stat + byteArrayOf(0x01)).let { it is CodecResult.Malformed })
+  }
+
+  @Test
   fun authorizationAndStorageMatrix_readOnlyVsWritePeerRevocationReadOnlyMountAndFullStorageOps() = runTest {
     val hub = TestTransportHub()
     val nodeKey = PeerPublicKey.fromBytes(ByteArray(32) { (it + 1).toByte() }).getOrThrow()

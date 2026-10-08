@@ -43,6 +43,7 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data
+                    android:host=""
                     android:scheme="com.homenode.oauth"
                     android:path="/oauth2redirect" />
             </intent-filter>

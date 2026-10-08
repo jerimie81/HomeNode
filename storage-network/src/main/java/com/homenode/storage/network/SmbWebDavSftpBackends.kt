@@ -162,10 +162,13 @@ class WebDavFileBackend(
   private val serverPresentedCertSha256Provider: () -> String? = { config.pinnedCertSha256 },
   private val backing: FileBackend = InMemoryFileBackend(isReadOnly = false),
   override val isReadOnly: Boolean = false,
+  private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
 ) : FileBackend {
 
   private suspend fun verifyWebDavSecurity(): StorageResult<Unit> {
-    val lanCheck = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port)
+    val lanCheck = LanStorageAddressPolicy.validateLanTarget(
+      config.hostIpLiteral, config.port, ownInterfaceIpsProvider(),
+    )
     if (lanCheck is StorageResult.Failure) return lanCheck
 
     val isHttps = config.baseUrl.startsWith("https://")
@@ -256,10 +259,13 @@ class SftpFileBackend(
   private val serverPresentedHostKeyProvider: () -> String = { config.pinnedHostKeyFingerprint },
   private val backing: FileBackend = InMemoryFileBackend(isReadOnly = false),
   override val isReadOnly: Boolean = false,
+  private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
 ) : FileBackend {
 
   private suspend fun verifySftpSecurity(): StorageResult<Unit> {
-    val lanCheck = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port)
+    val lanCheck = LanStorageAddressPolicy.validateLanTarget(
+      config.hostIpLiteral, config.port, ownInterfaceIpsProvider(),
+    )
     if (lanCheck is StorageResult.Failure) return lanCheck
 
     if (config.pinnedHostKeyFingerprint.isBlank()) {

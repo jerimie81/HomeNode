@@ -11,7 +11,9 @@ import com.homenode.core.storage.StorageError
 import com.homenode.core.storage.StorageException
 import com.homenode.core.storage.WriteMode
 import java.io.FileInputStream
+import java.io.OutputStream
 import java.nio.ByteBuffer
+import java.util.UUID
 
 /**
  * Production Android SAF [SafTreeAdapter] backed by [ContentResolver] and [DocumentsContract] (§8.5, Slice S7).
@@ -203,6 +205,68 @@ class AndroidContentResolverSafTreeAdapter(
       sizeBytes = bytes.size.toLong(),
       lastModifiedEpochMillis = System.currentTimeMillis(),
     )
+  }
+
+  override fun createTemporaryFile(parentDocumentId: String, displayName: String): SafDocumentMetadata {
+    if (!verifyPermissionGranted(requireWrite = true)) throw SecurityException("Write permission not granted")
+    val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocumentId)
+    val createdUri = DocumentsContract.createDocument(
+      contentResolver,
+      parentUri,
+      "application/octet-stream",
+      displayName,
+    ) ?: throw StorageException(StorageError.INTERNAL, "Unable to create SAF staging document")
+    val id = DocumentsContract.getDocumentId(createdUri)
+    return statDocument(id) ?: SafDocumentMetadata(id, displayName, false, 0L, System.currentTimeMillis())
+  }
+
+  override fun openOutputStream(documentId: String): OutputStream {
+    val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
+    return contentResolver.openOutputStream(docUri, "w")
+      ?: throw StorageException(StorageError.INTERNAL, "Unable to open SAF staging output")
+  }
+
+  override fun commitTemporaryFile(
+    parentDocumentId: String,
+    temporaryDocumentId: String,
+    displayName: String,
+    mode: WriteMode,
+  ): SafDocumentMetadata {
+    val temp = statDocument(temporaryDocumentId)
+      ?: throw StorageException(StorageError.NOT_FOUND, "SAF staging document disappeared")
+    if (!isChildDocument(parentDocumentId, temporaryDocumentId)) {
+      throw StorageException(StorageError.DENIED, "SAF staging document escaped its parent")
+    }
+    val matches = queryChildren(parentDocumentId).filter { it.displayName == displayName }
+    if (matches.size > 1) throw StorageException(StorageError.DUPLICATE_NAME, "Duplicate SAF target '$displayName'")
+    val existing = matches.singleOrNull()
+    if (existing?.isDirectory == true) throw StorageException(StorageError.PATH_INVALID, "Target is a directory")
+    if (existing != null && mode == WriteMode.CREATE_NEW) {
+      throw StorageException(StorageError.EXISTS, "SAF file '$displayName' already exists")
+    }
+
+    val tempUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, temporaryDocumentId)
+    if (existing == null) {
+      val renamed = DocumentsContract.renameDocument(contentResolver, tempUri, displayName)
+        ?: throw StorageException(StorageError.UNSUPPORTED, "SAF provider cannot rename staged files")
+      val id = DocumentsContract.getDocumentId(renamed)
+      return statDocument(id) ?: temp.copy(displayName = displayName)
+    }
+
+    val existingUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, existing.documentId)
+    val backupName = ".homenode-backup-${UUID.randomUUID()}"
+    val backupUri = DocumentsContract.renameDocument(contentResolver, existingUri, backupName)
+      ?: throw StorageException(StorageError.UNSUPPORTED, "SAF provider cannot safely replace files")
+    val committedUri = try {
+      DocumentsContract.renameDocument(contentResolver, tempUri, displayName)
+        ?: throw StorageException(StorageError.UNSUPPORTED, "SAF provider cannot rename staged files")
+    } catch (failure: Exception) {
+      runCatching { DocumentsContract.renameDocument(contentResolver, backupUri, displayName) }
+      throw failure
+    }
+    runCatching { DocumentsContract.deleteDocument(contentResolver, backupUri) }
+    val id = DocumentsContract.getDocumentId(committedUri)
+    return statDocument(id) ?: temp.copy(displayName = displayName)
   }
 
   override fun createDirectory(parentDocumentId: String, displayName: String): SafDocumentMetadata {

@@ -1,5 +1,13 @@
 # HomeNode — Component & Slice Status
 
+## Current implementation update — 2026-10-07
+
+- `HomeNodeFacade` now creates its transport after `NodeRuntime` loads the persisted node identity, and checks that the transport public key matches. A runtime test covers identity equality across start and restart. The WireGuard engine still has no real private-key configuration and remains unavailable/stubbed.
+- Network mount creation and SMB/WebDAV/SFTP connection checks exclude current local RFC1918 interface addresses.
+- Pending OAuth PKCE requests are capped at eight and expire after five minutes; abandoned verifiers are closed. A behavior test covers capacity and expiry.
+- SAF writes stream into a temporary sibling, enforce a 512 MiB backend quota, verify expected size, and commit via provider rename with rollback; failure and cancellation paths clean up staging files. A host test covers chunked success, mismatch preservation, and quota rejection.
+- These edits have only passed `git diff --check`; Gradle tests and device validation have not run.
+
 Truthfulness vocabulary: `implemented · tested · partial · stubbed · blocked`.
 *(Per `1_AGENT_CONFIG.md` §1 & §6: items are marked `implemented`, `partial`, or `stubbed` until you paste physical S8+ / machine verification output to promote them to `tested`.)*
 

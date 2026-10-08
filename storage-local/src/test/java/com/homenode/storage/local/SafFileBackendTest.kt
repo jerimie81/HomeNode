@@ -6,12 +6,36 @@ import com.homenode.core.storage.StorageError
 import com.homenode.core.storage.StorageResult
 import com.homenode.core.storage.WriteMode
 import kotlinx.coroutines.flow.flowOf
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SafFileBackendTest {
+
+  @Test
+  fun safBackend_streamsChunksAndPreservesOldFileWhenSizeCheckFails() = runTest {
+    val adapter = FakeSafTreeAdapter()
+    val backend = SafFileBackend(adapter, listingCacheTtlMs = 0L)
+    val path = PathValidator.parseRelative("stream.bin").getOrThrow()
+    val original = byteArrayOf(1, 2, 3, 4)
+    assertTrue(backend.write(path, WriteMode.CREATE_NEW, flowOf(byteArrayOf(1, 2), byteArrayOf(3, 4)), 4L).isSuccess)
+
+    val failedOverwrite = backend.write(path, WriteMode.OVERWRITE, flowOf(byteArrayOf(8, 9)), 3L)
+    assertEquals(StorageError.PATH_INVALID, (failedOverwrite as StorageResult.Failure).error)
+    val savedDoc = adapter.queryChildren(adapter.rootDocumentId).single { it.displayName == "stream.bin" }
+    assertTrue(original.contentEquals(adapter.readBytes(savedDoc.documentId, 0L, original.size)))
+    assertTrue(adapter.queryChildren(adapter.rootDocumentId).none { it.displayName.startsWith(".homenode-tmp-") })
+
+    val quotaResult = backend.write(
+      PathValidator.parseRelative("too-large.bin").getOrThrow(),
+      WriteMode.CREATE_NEW,
+      flow { error("quota should reject before collecting the body") },
+      512L * 1024L * 1024L + 1L,
+    )
+    assertEquals(StorageError.QUOTA, (quotaResult as StorageResult.Failure).error)
+  }
 
   @Test
   fun safBackend_enforcesContainmentDuplicateRejectionPermissionLossAndMicroSdEject() = runTest {

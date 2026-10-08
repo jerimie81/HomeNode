@@ -51,6 +51,7 @@ class MountManager(
   private val appContext: Context? = null,
   private val safAdapterFactory: ((MountConfig.SafConfig) -> SafTreeAdapter)? = null,
   private val onMountStatesChanged: () -> Unit = {},
+  private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
 ) : MountCatalog {
 
   private val mountsById = ConcurrentHashMap<MountId, StorageMount>()
@@ -106,15 +107,15 @@ class MountManager(
     // Validate LAN storage IP at config time (§8.6)
     when (config) {
       is MountConfig.SmbConfig -> {
-        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port)
+        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port, ownInterfaceIpsProvider())
         if (check is StorageResult.Failure) return check
       }
       is MountConfig.WebDavConfig -> {
-        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port)
+        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port, ownInterfaceIpsProvider())
         if (check is StorageResult.Failure) return check
       }
       is MountConfig.SftpConfig -> {
-        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port)
+        val check = LanStorageAddressPolicy.validateLanTarget(config.hostIpLiteral, config.port, ownInterfaceIpsProvider())
         if (check is StorageResult.Failure) return check
       }
       else -> Unit
@@ -305,18 +306,21 @@ class MountManager(
         vault = vault,
         adapter = FakeSmbSessionAdapter(),
         isReadOnly = readOnly,
+        ownInterfaceIpsProvider = ownInterfaceIpsProvider,
       )
       is MountConfig.WebDavConfig -> WebDavFileBackend(
         config = config,
         credentialKey = credKey ?: VaultKey("mount.${mountId.value}.secret"),
         vault = vault,
         isReadOnly = readOnly,
+        ownInterfaceIpsProvider = ownInterfaceIpsProvider,
       )
       is MountConfig.SftpConfig -> SftpFileBackend(
         config = config,
         credentialKey = credKey ?: VaultKey("mount.${mountId.value}.secret"),
         vault = vault,
         isReadOnly = readOnly,
+        ownInterfaceIpsProvider = ownInterfaceIpsProvider,
       )
       is MountConfig.CloudConfig -> CloudIdTreeBackend(
         provider = provider,

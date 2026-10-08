@@ -10,9 +10,12 @@ import com.homenode.core.storage.StorageException
 import com.homenode.core.storage.StorageResult
 import com.homenode.core.storage.WriteMode
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.min
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -43,6 +46,14 @@ interface SafTreeAdapter {
   fun statDocument(documentId: String): SafDocumentMetadata?
   fun readBytes(documentId: String, offset: Long, length: Int): ByteArray
   fun createOrReplaceFile(parentDocumentId: String, displayName: String, mode: WriteMode, bytes: ByteArray): SafDocumentMetadata
+  fun createTemporaryFile(parentDocumentId: String, displayName: String): SafDocumentMetadata
+  fun openOutputStream(documentId: String): OutputStream
+  fun commitTemporaryFile(
+    parentDocumentId: String,
+    temporaryDocumentId: String,
+    displayName: String,
+    mode: WriteMode,
+  ): SafDocumentMetadata
   fun createDirectory(parentDocumentId: String, displayName: String): SafDocumentMetadata
   fun deleteDocument(parentDocumentId: String, documentId: String, recursive: Boolean)
   fun moveDocument(
@@ -298,27 +309,43 @@ class SafFileBackend(
       return@withContext StorageResult.Failure(StorageError.NOT_FOUND, "Parent is not a directory")
     }
 
-    val out = ByteArrayOutputStream()
-    var total = 0L
-    data.collect { chunk ->
-      currentCoroutineContext().ensureActive()
-      total += chunk.size
-      if (total > FileBackend.MAX_WRITE_SIZE_BYTES) {
-        throw StorageException(StorageError.QUOTA, "Write exceeds max size")
-      }
-      out.write(chunk)
+    if (expectedSize != null && expectedSize < 0L) {
+      return@withContext StorageResult.Failure(StorageError.PATH_INVALID, "Negative expected size")
     }
-    val bytes = out.toByteArray()
-    if (expectedSize != null && expectedSize != bytes.size.toLong()) {
-      return@withContext StorageResult.Failure(StorageError.PATH_INVALID, "Size mismatch")
+    if (expectedSize != null && expectedSize > SAF_MAX_WRITE_SIZE_BYTES) {
+      return@withContext StorageResult.Failure(StorageError.QUOTA, "Write exceeds SAF quota")
     }
-
+    var temporary: SafDocumentMetadata? = null
+    var committed = false
     try {
       val existingMatches = adapter.queryChildren(parentMeta.documentId).filter { it.displayName == path.name }
       if (existingMatches.size > 1) {
         return@withContext StorageResult.Failure(StorageError.DUPLICATE_NAME, "Duplicate target '${path.name}'")
       }
-      val writtenMeta = adapter.createOrReplaceFile(parentMeta.documentId, path.name, mode, bytes)
+      if (existingMatches.singleOrNull()?.isDirectory == true) {
+        return@withContext StorageResult.Failure(StorageError.PATH_INVALID, "Target '${path.name}' is a directory")
+      }
+      if (mode == WriteMode.CREATE_NEW && existingMatches.isNotEmpty()) {
+        return@withContext StorageResult.Failure(StorageError.EXISTS, "File already exists")
+      }
+      val tempFile = adapter.createTemporaryFile(parentMeta.documentId, ".homenode-tmp-${UUID.randomUUID()}")
+      temporary = tempFile
+      var total = 0L
+      adapter.openOutputStream(tempFile.documentId).use { out ->
+        data.collect { chunk ->
+          currentCoroutineContext().ensureActive()
+          if (chunk.size.toLong() > SAF_MAX_WRITE_SIZE_BYTES - total) {
+            throw StorageException(StorageError.QUOTA, "Write exceeds SAF quota")
+          }
+          total += chunk.size
+          out.write(chunk)
+        }
+      }
+      if (expectedSize != null && expectedSize != total) {
+        return@withContext StorageResult.Failure(StorageError.PATH_INVALID, "Size mismatch")
+      }
+      val writtenMeta = adapter.commitTemporaryFile(parentMeta.documentId, tempFile.documentId, path.name, mode)
+      committed = true
       invalidateCache()
       StorageResult.Success(
         FileStat(
@@ -332,6 +359,14 @@ class SafFileBackend(
       StorageResult.Failure(StorageError.PERMISSION_LOST, "SAF permission lost during write")
     } catch (se: StorageException) {
       StorageResult.Failure(se.error, se.message)
+    } catch (ce: CancellationException) {
+      throw ce
+    } catch (e: Exception) {
+      StorageResult.Failure(StorageError.INTERNAL, "SAF write failed")
+    } finally {
+      if (!committed) temporary?.let { temp ->
+        runCatching { adapter.deleteDocument(parentMeta.documentId, temp.documentId, recursive = false) }
+      }
     }
   }
 
@@ -414,6 +449,7 @@ class SafFileBackend(
 
   companion object {
     const val LISTING_CACHE_TTL_MS = 1_500L
+    private const val SAF_MAX_WRITE_SIZE_BYTES = 512L * 1024L * 1024L
   }
 }
 
@@ -537,6 +573,47 @@ class FakeSafTreeAdapter(
     val created = FakeDoc(id, parentDocumentId, displayName, isDirectory = false, bytes = bytes.copyOf())
     docs[id] = created
     return created.toMeta()
+  }
+
+  override fun createTemporaryFile(parentDocumentId: String, displayName: String): SafDocumentMetadata =
+    createOrReplaceFile(parentDocumentId, displayName, WriteMode.CREATE_NEW, byteArrayOf())
+
+  override fun openOutputStream(documentId: String): OutputStream {
+    if (!readPermissionGranted || !writePermissionGranted) throw SecurityException("Write permission not granted")
+    val doc = docs[documentId] ?: throw StorageException(StorageError.NOT_FOUND, "Missing temporary document")
+    val buffer = ByteArrayOutputStream()
+    return object : OutputStream() {
+      override fun write(value: Int) = buffer.write(value)
+      override fun write(bytes: ByteArray, offset: Int, length: Int) = buffer.write(bytes, offset, length)
+      override fun close() {
+        doc.bytes = buffer.toByteArray()
+      }
+    }
+  }
+
+  override fun commitTemporaryFile(
+    parentDocumentId: String,
+    temporaryDocumentId: String,
+    displayName: String,
+    mode: WriteMode,
+  ): SafDocumentMetadata {
+    if (!readPermissionGranted || !writePermissionGranted) throw SecurityException("Write permission not granted")
+    val temporary = docs[temporaryDocumentId]
+      ?: throw StorageException(StorageError.NOT_FOUND, "Missing temporary document")
+    val existing = docs.values.firstOrNull { it.parentDocId == parentDocumentId && it.displayName == displayName }
+    if (existing != null && mode == WriteMode.CREATE_NEW) {
+      throw StorageException(StorageError.EXISTS, "File already exists")
+    }
+    if (existing?.isDirectory == true) {
+      throw StorageException(StorageError.PATH_INVALID, "Target is a directory")
+    }
+    if (existing != null) {
+      existing.bytes = temporary.bytes.copyOf()
+      docs.remove(temporaryDocumentId)
+      return existing.toMeta()
+    }
+    temporary.displayName = displayName
+    return temporary.toMeta()
   }
 
   override fun createDirectory(parentDocumentId: String, displayName: String): SafDocumentMetadata {

@@ -46,6 +46,7 @@ class NetworkDiscovery(
   private val mdnsSource: MdnsDiscoverySource,
   private val portProber: TcpPortProber,
   private val clockEpochMillis: () -> Long = { System.currentTimeMillis() },
+  private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
 ) {
   private var lastScanEpochMillis: Long = -1L
 
@@ -83,12 +84,19 @@ class NetworkDiscovery(
     val boundedHostCount = maxHostsToProbe.coerceIn(1, MAX_SUBNET_HOSTS)
     val boundedPorts = portsToProbe.filter { it in ALLOWED_STORAGE_PORTS }.take(4)
     val semaphore = Semaphore(MAX_CONCURRENCY)
+    val ownInterfaceIps = ownInterfaceIpsProvider()
 
     val combined = withTimeoutOrNull(MAX_SCAN_DURATION_MS) {
       coroutineScope {
         val mdnsDeferred = async {
           mdnsSource.queryMdnsServices()
-            .filter { LanStorageAddressPolicy.validateLanTarget(it.hostIp, it.port).isSuccess }
+            .filter {
+              LanStorageAddressPolicy.validateLanTarget(
+                it.hostIp,
+                it.port,
+                ownInterfaceIps,
+              ).isSuccess
+            }
             .map { it.copy(advertisedName = sanitizeUntrustedNetworkName(it.advertisedName)) }
         }
 
@@ -97,6 +105,9 @@ class NetworkDiscovery(
           boundedPorts.map { port ->
             async {
               currentCoroutineContext().ensureActive()
+              if (LanStorageAddressPolicy.validateLanTarget(hostIp, port, ownInterfaceIps).isFailure) {
+                return@async null
+              }
               semaphore.withPermit {
                 if (portProber.isPortOpen(hostIp, port, CONNECT_TIMEOUT_MS)) {
                   val proto = guessProtocolForPort(port)

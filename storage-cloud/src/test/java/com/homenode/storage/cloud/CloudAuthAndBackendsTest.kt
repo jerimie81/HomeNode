@@ -1,7 +1,9 @@
 package com.homenode.storage.cloud
 
 import com.homenode.core.storage.InMemoryCredentialVault
+import com.homenode.core.storage.CredentialVault
 import com.homenode.core.storage.PathValidator
+import com.homenode.core.storage.SecretBytes
 import com.homenode.core.storage.StorageError
 import com.homenode.core.storage.StorageProvider
 import com.homenode.core.storage.StorageResult
@@ -18,6 +20,106 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CloudAuthAndBackendsTest {
+
+  @Test
+  fun oauthPkce_capsPendingRequestsAndExpiresAbandonedState() = runTest {
+    var now = 10_000L
+    val endpoint = object : OAuthTokenEndpointAdapter {
+      override suspend fun exchangeCodeWithPkce(
+        provider: StorageProvider,
+        publicClientId: String,
+        redirectUri: String,
+        authorizationCode: String,
+        codeVerifierBytes: ByteArray,
+      ) = TokenExchangeResponse(TokenRefreshOutcome.SUCCESS, byteArrayOf(1), byteArrayOf(2), 3600L)
+
+      override suspend fun refreshAccessToken(
+        provider: StorageProvider,
+        publicClientId: String,
+        refreshTokenBytes: ByteArray,
+      ) = TokenExchangeResponse(TokenRefreshOutcome.SUCCESS, byteArrayOf(1), byteArrayOf(2), 3600L)
+
+      override suspend fun revokeTokenAtProvider(provider: StorageProvider, tokenBytes: ByteArray) = true
+    }
+    val auth = CloudAuthCoordinator(InMemoryCredentialVault(), endpoint) { now }
+    val requests = (1..8).map {
+      auth.startSystemBrowserPkceFlow(StorageProvider.GOOGLE_DRIVE, "client").getOrThrow()
+    }
+    assertEquals(StorageError.QUOTA, (auth.startSystemBrowserPkceFlow(
+      StorageProvider.GOOGLE_DRIVE, "client",
+    ) as StorageResult.Failure).error)
+
+    now += 5 * 60 * 1000L
+    assertTrue(
+      auth.completeRedirectCallback(
+        VaultKey("expired.pkce"), CloudProviderScopes.REDIRECT_URI, requests.first().state, "code",
+      ).isFailure
+    )
+    assertTrue(auth.startSystemBrowserPkceFlow(StorageProvider.GOOGLE_DRIVE, "client").isSuccess)
+  }
+
+  @Test
+  fun oauthPkce_encodesAuthorizationParametersAndFailsClosedWhenRotationCannotPersist() = runTest {
+    val backing = InMemoryCredentialVault()
+    var putCount = 0
+    val vault = object : CredentialVault {
+      override suspend fun put(key: VaultKey, secret: SecretBytes): StorageResult<Unit> {
+        putCount++
+        return if (putCount == 1) backing.put(key, secret) else {
+          secret.close()
+          StorageResult.Failure(StorageError.INTERNAL, "simulated vault write failure")
+        }
+      }
+
+      override suspend fun get(key: VaultKey) = backing.get(key)
+      override suspend fun delete(key: VaultKey) = backing.delete(key)
+      override suspend fun wipeAll() = backing.wipeAll()
+    }
+    var now = 1_000L
+    val endpoint = object : OAuthTokenEndpointAdapter {
+      override suspend fun exchangeCodeWithPkce(
+        provider: StorageProvider,
+        publicClientId: String,
+        redirectUri: String,
+        authorizationCode: String,
+        codeVerifierBytes: ByteArray,
+      ) = TokenExchangeResponse(
+        TokenRefreshOutcome.SUCCESS,
+        "access-1".encodeToByteArray(),
+        "refresh-1".encodeToByteArray(),
+        60L,
+      )
+
+      override suspend fun refreshAccessToken(
+        provider: StorageProvider,
+        publicClientId: String,
+        refreshTokenBytes: ByteArray,
+      ) = TokenExchangeResponse(
+        TokenRefreshOutcome.SUCCESS,
+        "access-2".encodeToByteArray(),
+        "refresh-2".encodeToByteArray(),
+        60L,
+      )
+
+      override suspend fun revokeTokenAtProvider(provider: StorageProvider, tokenBytes: ByteArray) = true
+    }
+    val auth = CloudAuthCoordinator(vault, endpoint) { now }
+    val key = VaultKey("cloud.rotation.failure")
+    val request = auth.startSystemBrowserPkceFlow(
+      StorageProvider.GOOGLE_DRIVE,
+      "client&injected=value",
+    ).getOrThrow()
+    assertTrue(request.systemBrowserAuthorizationUrl.contains("client_id=client%26injected%3Dvalue"))
+    assertTrue(
+      auth.completeRedirectCallback(key, CloudProviderScopes.REDIRECT_URI, request.state, "code").isSuccess
+    )
+
+    now += 61_000L
+    val refresh = auth.getValidAccessToken(key, StorageProvider.GOOGLE_DRIVE, "client&injected=value")
+    assertEquals(StorageError.AUTH_REQUIRED, (refresh as StorageResult.Failure).error)
+    val repeat = auth.getValidAccessToken(key, StorageProvider.GOOGLE_DRIVE, "client&injected=value")
+    assertEquals(StorageError.AUTH_REQUIRED, (repeat as StorageResult.Failure).error)
+  }
 
   @Test
   fun oauthPkce_enforcesStateRedirectSingleFlightRefreshAndNoRetryStormOnRevocation() = runTest {

@@ -308,7 +308,9 @@ class CloudAuthCoordinator(
   private val clockEpochMillis: () -> Long = { System.currentTimeMillis() },
 ) {
   private val rng = SecureRandom()
-  private val pendingRequestsByState = ConcurrentHashMap<String, PkceAuthRequest>()
+  private data class PendingPkceRequest(val request: PkceAuthRequest, val createdAtEpochMillis: Long)
+  private val pendingPkceLock = Any()
+  private val pendingRequestsByState = ConcurrentHashMap<String, PendingPkceRequest>()
   private val refreshMutexByAccount = ConcurrentHashMap<VaultKey, Mutex>()
   private val cachedAccessTokens = ConcurrentHashMap<VaultKey, CachedAccessToken>()
   private val reauthRequiredAccounts = ConcurrentHashMap.newKeySet<VaultKey>()
@@ -348,10 +350,18 @@ class CloudAuthCoordinator(
       else -> return StorageResult.Failure(StorageError.UNSUPPORTED, "Not a cloud provider: $provider")
     }
 
-    val url = "$authEndpoint?response_type=code&client_id=$publicClientId" +
-      "&redirect_uri=${CloudProviderScopes.REDIRECT_URI}" +
-      "&code_challenge=$challengeS256&code_challenge_method=S256" +
-      "&state=$state&scope=${scopes.joinToString("%20")}"
+    val url = buildAuthorizationUrl(
+      endpoint = authEndpoint,
+      params = linkedMapOf(
+        "response_type" to "code",
+        "client_id" to publicClientId,
+        "redirect_uri" to CloudProviderScopes.REDIRECT_URI,
+        "code_challenge" to challengeS256,
+        "code_challenge_method" to "S256",
+        "state" to state,
+        "scope" to scopes.joinToString(" "),
+      ),
+    )
 
     val req = PkceAuthRequest(
       provider = provider,
@@ -363,7 +373,15 @@ class CloudAuthCoordinator(
       scopes = scopes,
       systemBrowserAuthorizationUrl = url,
     )
-    pendingRequestsByState[state] = req
+    synchronized(pendingPkceLock) {
+      val createdAt = clockEpochMillis()
+      pruneExpiredPkceRequests(createdAt)
+      if (pendingRequestsByState.size >= MAX_PENDING_PKCE_REQUESTS) {
+        req.codeVerifier.close()
+        return StorageResult.Failure(StorageError.QUOTA, "Too many pending OAuth requests")
+      }
+      pendingRequestsByState[state] = PendingPkceRequest(req, createdAt)
+    }
     return StorageResult.Success(req)
   }
 
@@ -376,8 +394,11 @@ class CloudAuthCoordinator(
     if (receivedRedirectUri != CloudProviderScopes.REDIRECT_URI) {
       return StorageResult.Failure(StorageError.DENIED, "OAuth redirect URI mismatch")
     }
-    val pending = pendingRequestsByState.remove(receivedState)
-      ?: return StorageResult.Failure(StorageError.DENIED, "Unknown or replayed OAuth state parameter")
+    val pendingEntry = synchronized(pendingPkceLock) {
+      pruneExpiredPkceRequests(clockEpochMillis())
+      pendingRequestsByState.remove(receivedState)
+    } ?: return StorageResult.Failure(StorageError.DENIED, "Unknown, expired, or replayed OAuth state parameter")
+    val pending = pendingEntry.request
     if (authorizationCode.isBlank()) {
       pending.codeVerifier.close()
       return StorageResult.Failure(StorageError.DENIED, "Empty authorization code")
@@ -432,6 +453,10 @@ class CloudAuthCoordinator(
     if (fastCached != null && now < fastCached.expiresAtEpochMillis) {
       return StorageResult.Success(SecretBytes(fastCached.tokenBytes.copyOf()))
     }
+    if (fastCached != null) {
+      cachedAccessTokens.remove(accountVaultKey, fastCached)
+      fastCached.tokenBytes.fill(0)
+    }
 
     val mutex = refreshMutexByAccount.getOrPut(accountVaultKey) { Mutex() }
     return mutex.withLock {
@@ -445,6 +470,10 @@ class CloudAuthCoordinator(
       val secondCached = cachedAccessTokens[accountVaultKey]
       if (secondCached != null && recheckNow < secondCached.expiresAtEpochMillis) {
         return@withLock StorageResult.Success(SecretBytes(secondCached.tokenBytes.copyOf()))
+      }
+      if (secondCached != null) {
+        cachedAccessTokens.remove(accountVaultKey, secondCached)
+        secondCached.tokenBytes.fill(0)
       }
 
       val refreshRes = vault.get(accountVaultKey)
@@ -460,7 +489,20 @@ class CloudAuthCoordinator(
           val newAccess = exchange.accessTokenBytes
             ?: return@withLock StorageResult.Failure(StorageError.INTERNAL, "Empty refreshed access token")
           exchange.refreshTokenBytes?.let { rotated ->
-            vault.put(accountVaultKey, SecretBytes(rotated))
+            val persisted = try {
+              vault.put(accountVaultKey, SecretBytes(rotated.copyOf()))
+            } finally {
+              rotated.fill(0)
+            }
+            if (persisted is StorageResult.Failure) {
+              newAccess.fill(0)
+              cachedAccessTokens.remove(accountVaultKey)?.tokenBytes?.fill(0)
+              reauthRequiredAccounts.add(accountVaultKey)
+              return@withLock StorageResult.Failure(
+                StorageError.AUTH_REQUIRED,
+                "Unable to persist rotated refresh token; re-authentication required"
+              )
+            }
           }
           cachedAccessTokens[accountVaultKey] = CachedAccessToken(
             tokenBytes = newAccess.copyOf(),
@@ -493,6 +535,29 @@ class CloudAuthCoordinator(
       runCatching { tokenEndpoint.revokeTokenAtProvider(provider, refreshBytes) }
     }
     return vault.delete(accountVaultKey)
+  }
+
+  private fun buildAuthorizationUrl(endpoint: String, params: Map<String, String>): String {
+    val encoded = params.entries.joinToString("&") { (key, value) ->
+      "${URLEncoder.encode(key, Charsets.UTF_8.name())}=" +
+        URLEncoder.encode(value, Charsets.UTF_8.name())
+    }
+    return "$endpoint?$encoded"
+  }
+
+  private fun pruneExpiredPkceRequests(nowEpochMillis: Long) {
+    val expired = pendingRequestsByState.entries.filter { (_, pending) ->
+      nowEpochMillis >= pending.createdAtEpochMillis &&
+        nowEpochMillis - pending.createdAtEpochMillis >= PKCE_REQUEST_TTL_MILLIS
+    }
+    expired.forEach { (state, pending) ->
+      if (pendingRequestsByState.remove(state, pending)) pending.request.codeVerifier.close()
+    }
+  }
+
+  private companion object {
+    const val MAX_PENDING_PKCE_REQUESTS = 8
+    const val PKCE_REQUEST_TTL_MILLIS = 5 * 60 * 1000L
   }
 }
 

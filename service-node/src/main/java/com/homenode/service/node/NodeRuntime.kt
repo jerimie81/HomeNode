@@ -7,6 +7,7 @@ import com.homenode.core.storage.StorageResult
 import com.homenode.core.transport.EndpointHint
 import com.homenode.core.transport.Reachability
 import com.homenode.core.transport.Transport
+import com.homenode.core.transport.PeerPublicKey
 import com.homenode.core.transport.TransportImplementationStatus
 import com.homenode.core.transport.TransportResult
 import com.homenode.core.transport.TransportState
@@ -108,6 +109,19 @@ class NodeRuntime(
         return@withLock _snapshot.value
       }
       val nodeIdentity = (idRes as StorageResult.Success).value
+
+      // Construct the selected transport from the persisted identity before it can be started.
+      if (transport is IdentityBoundTransport) {
+        val identityKey = PeerPublicKey.fromBase64Url(nodeIdentity.publicKey.base64Url)
+        if (identityKey is com.homenode.core.transport.TransportResult.Failure) {
+          _snapshot.value = _snapshot.value.copy(
+            state = NodeState.FAILED,
+            failedReason = "IdentityUnavailable: persisted public key is invalid",
+          )
+          return@withLock _snapshot.value
+        }
+        transport.bind((identityKey as com.homenode.core.transport.TransportResult.Success).value)
+      }
 
       // 2. Create runtime CoroutineScope only after identity succeeds
       val scope = CoroutineScope(SupervisorJob() + dispatcher)

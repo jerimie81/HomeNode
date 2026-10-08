@@ -19,6 +19,7 @@ import com.homenode.core.transport.PeerEndpointConfig
 import com.homenode.core.transport.PeerPublicKey
 import com.homenode.core.transport.TestTransport
 import com.homenode.core.transport.TestTransportHub
+import com.homenode.core.transport.TransportSelectionMode
 import com.homenode.core.transport.TunnelIp
 import com.homenode.storage.cloud.CloudAuthCoordinator
 import com.homenode.storage.cloud.OAuthTokenEndpointAdapter
@@ -271,9 +272,11 @@ class ServiceNodeTest {
     val mountManager = MountManager(vault, authorizer, cloudAuth, retryScheduler, logger)
     val lanProxy = LanProxy(authorizer, logger)
 
-    val transportKey = PeerPublicKey.fromBytes(ByteArray(32) { (it + 1).toByte() }).getOrThrow()
     val transportIp = TunnelIp.parse("10.66.0.1").getOrThrow()
-    val transport = TestTransport(transportKey, transportIp)
+    val transport = IdentityBoundTransport(
+      mode = TransportSelectionMode.TEST_IN_PROCESS,
+      localTunnelIp = transportIp,
+    ) { persistedIdentityKey -> TestTransport(persistedIdentityKey, transportIp) }
 
     val runtime = NodeRuntime(
       identityManager = identityMgr,
@@ -289,6 +292,7 @@ class ServiceNodeTest {
 
     val snapRunning = runtime.start()
     assertEquals(NodeState.RUNNING, snapRunning.state)
+    assertEquals(snapRunning.identity!!.publicKey.base64Url, transport.localPublicKey.base64Url)
 
     // Wi-Fi loss transitions to DEGRADED, never FAILED (§11)
     runtime.onWifiConnectivityChanged(false)
@@ -310,6 +314,10 @@ class ServiceNodeTest {
 
     val snapStopped = runtime.stop()
     assertEquals(NodeState.STOPPED, snapStopped.state)
+    val restarted = runtime.start()
+    assertEquals(NodeState.RUNNING, restarted.state)
+    assertEquals(restarted.identity!!.publicKey.base64Url, transport.localPublicKey.base64Url)
+    runtime.stop()
 
     // Log audit (§14, §16): grep all logged events for forbidden secret patterns
     val serializedLogs = logger.events.value.joinToString("\n") { "${it.type}:${it.safeDetail}" }
