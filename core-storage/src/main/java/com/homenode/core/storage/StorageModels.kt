@@ -108,6 +108,7 @@ sealed interface MountConfig {
     val accountDisplayName: String,
     val rootFolderId: String,
     val isAppFolderScopeOnly: Boolean = true,
+    val publicClientId: String = "homenode-public-client",
   ) : MountConfig
 }
 

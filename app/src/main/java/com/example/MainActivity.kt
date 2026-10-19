@@ -903,6 +903,7 @@ private fun PeersAndPairingTab(
   onRequestCloudGrant: (PendingCloudGrant) -> Unit,
 ) {
   var newPeerLabel by rememberSaveable { mutableStateOf("") }
+  var scannedPeerQrUri by rememberSaveable { mutableStateOf("") }
   var grantDefaultNonCloud by rememberSaveable { mutableStateOf(true) }
 
   LazyColumn(
@@ -946,6 +947,13 @@ private fun PeersAndPairingTab(
             singleLine = true,
             modifier = Modifier.fillMaxWidth().testTag("pair_peer_label_input")
           )
+          OutlinedTextField(
+            value = scannedPeerQrUri,
+            onValueChange = { scannedPeerQrUri = it },
+            label = { Text("Scanned Remote Peer Response QR URI (homenode://pair?...)") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth().testTag("scanned_peer_qr_input")
+          )
           Row(verticalAlignment = Alignment.CenterVertically) {
             Checkbox(
               checked = grantDefaultNonCloud,
@@ -953,17 +961,28 @@ private fun PeersAndPairingTab(
             )
             Text("Grant READ on Local & Network mounts (Excludes Cloud)", style = MaterialTheme.typography.bodySmall)
           }
-          Button(
-            onClick = {
-              facade.pairNewDeviceModeA(
-                label = newPeerLabel.ifBlank { "Paired-Device" },
-                grantDefaultNonCloudRead = grantDefaultNonCloud,
-              )
-              newPeerLabel = ""
-            },
-            modifier = Modifier.testTag("confirm_mode_a_pair_button")
-          ) {
-            Text("Confirm Mode A Peer & Allocate /32 Tunnel IP")
+          Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+              onClick = {
+                if (scannedPeerQrUri.isNotBlank()) {
+                  facade.completePairingFromScannedResponse(
+                    scannedPeerQrUri = scannedPeerQrUri.trim(),
+                    label = newPeerLabel.ifBlank { "Paired-Device" },
+                    grantDefaultNonCloudRead = grantDefaultNonCloud,
+                  )
+                  scannedPeerQrUri = ""
+                } else {
+                  facade.pairNewDeviceModeA(
+                    label = newPeerLabel.ifBlank { "Paired-Device" },
+                    grantDefaultNonCloudRead = grantDefaultNonCloud,
+                  )
+                }
+                newPeerLabel = ""
+              },
+              modifier = Modifier.testTag("confirm_mode_a_pair_button")
+            ) {
+              Text("Confirm Mode A Peer & Allocate /32 Tunnel IP")
+            }
           }
         }
       }

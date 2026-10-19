@@ -108,7 +108,7 @@ class NetworkStorageAndDiscoveryTest {
       override suspend fun isPortOpen(hostIp: String, port: Int, timeoutMs: Int): Boolean =
         hostIp == "192.168.1.10" && port == 22
     }
-    val discovery = NetworkDiscovery(mdns, prober) { now }
+    val discovery = NetworkDiscovery(mdns, prober, clockEpochMillis = { now })
 
     // Background / peer-triggered scan must be denied
     assertEquals(
@@ -174,5 +174,49 @@ class NetworkStorageAndDiscoveryTest {
     ).getOrThrow()
     assertFalse(probedHosts.contains("192.168.1.2"))
     assertFalse(results.any { it.hostIp == "192.168.1.2" })
+  }
+
+  @Test
+  fun backends_reValidateOwnInterfaceIpsOnEveryOperationAndRejectSelfConnect() = runTest {
+    val vault = InMemoryCredentialVault()
+    val credKey = VaultKey("net.selfcheck")
+    vault.put(credKey, SecretBytes("secret".encodeToByteArray()))
+    var currentOwnIps = setOf("192.168.1.2")
+
+    val smb = SmbFileBackend(
+      config = MountConfig.SmbConfig("192.168.1.50", 445, "media", "alice"),
+      credentialKey = credKey,
+      vault = vault,
+      adapter = FakeSmbSessionAdapter(),
+      ownInterfaceIpsProvider = { currentOwnIps },
+    )
+    val webDav = WebDavFileBackend(
+      config = MountConfig.WebDavConfig(
+        baseUrl = "https://192.168.1.50:5006/dav",
+        hostIpLiteral = "192.168.1.50",
+        port = 5006,
+        username = "alice",
+        pinnedCertSha256 = "AA:BB",
+      ),
+      credentialKey = credKey,
+      vault = vault,
+      ownInterfaceIpsProvider = { currentOwnIps },
+    )
+    val sftp = SftpFileBackend(
+      config = MountConfig.SftpConfig("192.168.1.50", 22, "alice", "/", "SHA256:pin"),
+      credentialKey = credKey,
+      vault = vault,
+      ownInterfaceIpsProvider = { currentOwnIps },
+    )
+
+    assertTrue(smb.list(SafePath.ROOT).isSuccess)
+    assertTrue(webDav.list(SafePath.ROOT).isSuccess)
+    assertTrue(sftp.list(SafePath.ROOT).isSuccess)
+
+    // When device roaming changes its own interface IP to match 192.168.1.50, all 3 must reject immediately
+    currentOwnIps = setOf("192.168.1.50", "10.0.0.5")
+    assertEquals(StorageError.DENIED, (smb.list(SafePath.ROOT) as StorageResult.Failure).error)
+    assertEquals(StorageError.DENIED, (webDav.list(SafePath.ROOT) as StorageResult.Failure).error)
+    assertEquals(StorageError.DENIED, (sftp.list(SafePath.ROOT) as StorageResult.Failure).error)
   }
 }

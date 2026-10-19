@@ -3,14 +3,17 @@ package com.homenode.service.node
 import com.homenode.core.identity.NodeIdentityManager
 import com.homenode.core.identity.NodePublicIdentity
 import com.homenode.core.identity.PeerAuthorizer
+import com.homenode.core.storage.CredentialVault
 import com.homenode.core.storage.StorageResult
 import com.homenode.core.transport.EndpointHint
+import com.homenode.core.transport.PeerEndpointConfig
 import com.homenode.core.transport.Reachability
 import com.homenode.core.transport.Transport
 import com.homenode.core.transport.PeerPublicKey
 import com.homenode.core.transport.TransportImplementationStatus
 import com.homenode.core.transport.TransportResult
 import com.homenode.core.transport.TransportState
+import com.homenode.core.transport.TunnelIp
 import com.homenode.service.files.FileService
 import kotlin.coroutines.cancellation.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -64,6 +67,8 @@ class NodeRuntime(
   val logger: SafeEventLogger,
   val retryScheduler: ComponentRetryScheduler,
   private val dispatcher: CoroutineDispatcher = Dispatchers.Default,
+  private val vault: CredentialVault? = null,
+  private val operationalStateStore: NodeOperationalStateStore? = null,
 ) {
   private val transitionMutex = Mutex()
   private var runtimeScope: CoroutineScope? = null
@@ -110,6 +115,29 @@ class NodeRuntime(
       }
       val nodeIdentity = (idRes as StorageResult.Success).value
 
+      // 1b. Load persisted operational state (peers, mounts, LAN destinations) if configured; fail-closed on corruption
+      if (operationalStateStore != null) {
+        val stateRes = operationalStateStore.load()
+        if (stateRes is StorageResult.Failure) {
+          _snapshot.value = _snapshot.value.copy(
+            state = NodeState.FAILED,
+            degradedReason = null,
+            failedReason = stateRes.message,
+          )
+          return@withLock _snapshot.value
+        }
+        val persisted = (stateRes as StorageResult.Success).value
+        if (authorizer.listPeers().isEmpty() && persisted.peers.isNotEmpty()) {
+          authorizer.restorePersistedPeers(persisted.peers)
+        }
+        if (mountManager.listMounts().isEmpty() && persisted.mounts.isNotEmpty()) {
+          mountManager.restorePersistedMounts(persisted.mounts)
+        }
+        if (lanProxy.destinationsFlow.value.isEmpty() && persisted.lanDestinations.isNotEmpty()) {
+          lanProxy.restoreDestinations(persisted.lanDestinations)
+        }
+      }
+
       // Construct the selected transport from the persisted identity before it can be started.
       if (transport is IdentityBoundTransport) {
         val identityKey = PeerPublicKey.fromBase64Url(nodeIdentity.publicKey.base64Url)
@@ -123,21 +151,39 @@ class NodeRuntime(
         transport.bind((identityKey as com.homenode.core.transport.TransportResult.Success).value)
       }
 
+      // Configure private key on transport when vault is provided (enables real UserspaceUdpWireGuardEngine)
+      if (vault != null) {
+        val privRes = vault.get(NodeIdentityManager.PRIVATE_KEY_VAULT_KEY)
+        if (privRes is StorageResult.Success) {
+          privRes.value?.useBytes { keyBytes ->
+            transport.configurePrivateKey(keyBytes)
+          }
+        }
+      }
+
       // 2. Create runtime CoroutineScope only after identity succeeds
       val scope = CoroutineScope(SupervisorJob() + dispatcher)
       runtimeScope = scope
 
-      // 3. Start Transport
+      // 3. Start Transport & re-register authorized peers
       val transportRes = transport.start()
       val transportDegraded = transportRes is TransportResult.Failure ||
         transport.state.value != TransportState.RUNNING
+      for (peer in authorizer.listPeers()) {
+        if (!peer.revoked) {
+          val pKey = (PeerPublicKey.fromBase64Url(peer.peerId.base64Url) as? TransportResult.Success)?.value ?: continue
+          val tIp = (TunnelIp.parse(peer.tunnelIp) as? TransportResult.Success)?.value ?: continue
+          transport.addPeer(PeerEndpointConfig(pKey, tIp, peer.endpointHints.firstOrNull()))
+        }
+      }
 
       // 4. Discover Reachability endpoints
       val endpoints = runCatching { reachability.discoverEndpoints(51820) }.getOrDefault(emptyList())
       logger.logTransportConnected(endpoints.size)
 
-      // 5. Start FileService over Transport
+      // 5. Start FileService and LanProxy over Transport
       fileService.start(scope)
+      lanProxy.start(scope, transport)
 
       // 6. Compute RUNNING vs DEGRADED state
       val mountsImpaired = mountManager.hasAnyImpairedMount()
@@ -199,6 +245,7 @@ class NodeRuntime(
 
   private suspend fun cleanupComponentsLocked() {
     runCatching { retryScheduler.cancelAll() }
+    runCatching { lanProxy.stop() }
     runCatching { fileService.stop() }
     runCatching { transport.stop() }
     runtimeScope?.cancel()

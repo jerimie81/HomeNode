@@ -33,6 +33,9 @@ data class SmbSessionInfo(
  * Narrow interface isolating SMB wire library (`// VERIFY: com.hierynomus:smbj` or `jcifs-ng`) (§8.6, Slice S9).
  */
 interface SmbSessionAdapter {
+  val isWireStubbed: Boolean
+    get() = true
+
   suspend fun authenticateAndConnect(
     config: MountConfig.SmbConfig,
     passwordBytes: ByteArray,
@@ -63,6 +66,9 @@ class SmbFileBackend(
   override val isReadOnly: Boolean = false,
   private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
 ) : FileBackend {
+
+  val isWireStubbed: Boolean
+    get() = adapter.isWireStubbed
 
   private suspend fun verifyConnectionAndPolicy(): StorageResult<SmbSessionInfo> {
     val policyRes = LanStorageAddressPolicy.validateLanTarget(
@@ -163,6 +169,7 @@ class WebDavFileBackend(
   private val backing: FileBackend = InMemoryFileBackend(isReadOnly = false),
   override val isReadOnly: Boolean = false,
   private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
+  val isWireStubbed: Boolean = true,
 ) : FileBackend {
 
   private suspend fun verifyWebDavSecurity(): StorageResult<Unit> {
@@ -260,6 +267,7 @@ class SftpFileBackend(
   private val backing: FileBackend = InMemoryFileBackend(isReadOnly = false),
   override val isReadOnly: Boolean = false,
   private val ownInterfaceIpsProvider: () -> Set<String> = { emptySet() },
+  val isWireStubbed: Boolean = true,
 ) : FileBackend {
 
   private suspend fun verifySftpSecurity(): StorageResult<Unit> {

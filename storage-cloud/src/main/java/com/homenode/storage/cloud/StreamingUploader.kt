@@ -90,7 +90,26 @@ internal fun HttpResponse.toUploadException(provider: CloudProvider): UploadExce
  * once more data arrives, so the last buffer is always the (possibly aligned) final
  * chunk and expectedSize is verified BEFORE the commit request is sent.
  */
-class StreamingUploader(private val adapter: CloudUploadAdapter) {
+class StreamingUploader(
+    private val adapter: CloudUploadAdapter,
+    private val maxTransientRetries: Int = 0,
+    private val retryBackoffMillis: Long = 50L,
+) {
+
+    private suspend fun <T> withTransientRetry(block: suspend () -> T): T {
+        var attempt = 0
+        while (true) {
+            try {
+                return block()
+            } catch (pe: UploadException.ProviderError) {
+                val isTransient = pe.status == 429 || pe.status in setOf(502, 503, 504)
+                if (!isTransient || attempt >= maxTransientRetries) throw pe
+                val delayMs = retryBackoffMillis * (1L shl attempt.coerceAtMost(5))
+                if (delayMs > 0L) kotlinx.coroutines.delay(delayMs)
+                attempt++
+            }
+        }
+    }
 
     suspend fun upload(target: UploadTarget, expectedSize: Long?, body: Flow<ByteArray>): RemoteObject {
         require(adapter.chunkGranularityBytes > 0 && adapter.chunkSizeBytes > 0 &&
@@ -105,7 +124,7 @@ class StreamingUploader(private val adapter: CloudUploadAdapter) {
             throw UploadException.SizeRequired(adapter.provider)
         }
 
-        val session = adapter.open(target, expectedSize)
+        val session = withTransientRetry { adapter.open(target, expectedSize) }
         try {
             val cap = if (expectedSize == null) adapter.chunkSizeBytes
             else minOf(adapter.chunkSizeBytes.toLong(), maxOf(expectedSize, 1L)).toInt()
@@ -126,7 +145,9 @@ class StreamingUploader(private val adapter: CloudUploadAdapter) {
                 while (pos < chunk.size) {
                     if (filled == buf.size) {
                         check(filled % adapter.chunkGranularityBytes == 0)
-                        session.append(buf, filled, sent)
+                        val flushLen = filled
+                        val flushOffset = sent
+                        withTransientRetry { session.append(buf, flushLen, flushOffset) }
                         sent += filled
                         filled = 0
                     }
@@ -137,7 +158,10 @@ class StreamingUploader(private val adapter: CloudUploadAdapter) {
                 }
             }
             if (expectedSize != null && total != expectedSize) throw UploadException.SizeMismatch(expectedSize, total)
-            return session.finish(buf, filled, sent, total)
+            val finalFilled = filled
+            val finalSent = sent
+            val finalTotal = total
+            return withTransientRetry { session.finish(buf, finalFilled, finalSent, finalTotal) }
         } catch (t: Throwable) {
             // Also runs on cancellation: abort must complete even though this coroutine is cancelled.
             withContext(NonCancellable) { runCatching { session.abort() } }

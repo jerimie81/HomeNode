@@ -200,7 +200,7 @@ class CoreIdentityTest {
     // A real response preserves the node-issued token but identifies the remote device, not the node.
     val uri = PairingPayloadParser.formatUri(qrPayload.copy(publicKey = remotePublicKey))
 
-    // First use succeeds
+    // First use succeeds and preserves endpointHints
     val mountId = MountId.generate()
     val firstConfirm = coordinator.confirmPeerFromScannedQr(
       scannedPeerQrUri = uri,
@@ -208,7 +208,9 @@ class CoreIdentityTest {
       userSelectedCapabilities = setOf(Capability.Files(mountId, AccessMode.READ)),
     )
     assertTrue(firstConfirm.isSuccess)
-    assertEquals(remotePublicKey, (firstConfirm as PairingResult.Success).value.peerId)
+    val confirmedRecord = (firstConfirm as PairingResult.Success).value
+    assertEquals(remotePublicKey, confirmedRecord.peerId)
+    assertEquals(listOf("192.168.1.10:51820"), confirmedRecord.endpointHints)
 
     // Replay of same QR must fail (single-use token consumed)
     val replayConfirm = coordinator.confirmPeerFromScannedQr(
@@ -217,6 +219,21 @@ class CoreIdentityTest {
       userSelectedCapabilities = emptySet(),
     )
     assertTrue("Replayed QR must be rejected", replayConfirm.isFailure)
+
+    // Token mismatch and 3-strike lockout invalidates active invitation tokens
+    val freshQr = coordinator.createNodeIntroductionQr(identity, listOf("192.168.1.10:51820"))
+    val forgedTokenUri = PairingPayloadParser.formatUri(
+      freshQr.copy(publicKey = remotePublicKey, singleUseToken = "AAAAAAAAAAAAAAAAAAAAAA")
+    )
+    assertTrue(coordinator.confirmPeerFromScannedQr(forgedTokenUri, "Bad1", emptySet()).isFailure)
+    assertTrue(coordinator.confirmPeerFromScannedQr(forgedTokenUri, "Bad2", emptySet()).isFailure)
+    assertTrue(coordinator.confirmPeerFromScannedQr(forgedTokenUri, "Bad3", emptySet()).isFailure)
+    // After 3 failed attempts, even the valid token from freshQr is invalidated!
+    val validAfterLockout = PairingPayloadParser.formatUri(freshQr.copy(publicKey = remotePublicKey))
+    assertTrue(
+      "Active tokens must be cleared after 3 failed pairing attempts",
+      coordinator.confirmPeerFromScannedQr(validAfterLockout, "LockedOut", emptySet()).isFailure
+    )
 
     // Hostile URIs (secret leak, duplicate params, expired, unknown version)
     assertTrue(
@@ -228,5 +245,41 @@ class CoreIdentityTest {
     assertTrue(
       PairingPayloadParser.parse(uri, now + PairingPayloadParser.MAX_TTL_MILLIS + 1).isFailure
     )
+  }
+
+  @Test
+  fun peerAuthorizer_restorePersistedPeersRetainsGrantsAndKeepsRevokedPeersRevoked() {
+    val now = 2_000_000L
+    val authorizer1 = PeerAuthorizer { now }
+    val (_, activePeer) = NodeIdentityManager.generateEphemeralKeypair()
+    val (_, revokedPeer) = NodeIdentityManager.generateEphemeralKeypair()
+    val mountId = MountId.generate()
+
+    val recActive = authorizer1.registerOrUpdatePeer(
+      peerId = activePeer,
+      label = "Active Phone",
+      capabilities = setOf(Capability.Files(mountId, AccessMode.READ)),
+      endpointHints = listOf("192.168.1.77:51820"),
+    )
+    authorizer1.registerOrUpdatePeer(
+      peerId = revokedPeer,
+      label = "Revoked Tablet",
+      capabilities = setOf(Capability.Files(mountId, AccessMode.WRITE)),
+    )
+    authorizer1.revokePeer(revokedPeer)
+
+    val persistedSnapshot = authorizer1.listPeers()
+
+    // Restore into a brand-new PeerAuthorizer (simulating process restart)
+    val authorizer2 = PeerAuthorizer { now }
+    authorizer2.restorePersistedPeers(persistedSnapshot)
+
+    assertEquals(recActive.tunnelIp, authorizer2.getPeer(activePeer)?.tunnelIp)
+    assertEquals(listOf("192.168.1.77:51820"), authorizer2.getPeer(activePeer)?.endpointHints)
+    assertTrue(authorizer2.can(activePeer, Capability.Files(mountId, AccessMode.READ)))
+    assertFalse(authorizer2.can(activePeer, Capability.Files(mountId, AccessMode.WRITE)))
+
+    assertTrue(authorizer2.getPeer(revokedPeer)?.revoked == true)
+    assertFalse(authorizer2.can(revokedPeer, Capability.Files(mountId, AccessMode.READ)))
   }
 }

@@ -348,17 +348,29 @@ class CloudAuthCoordinator(
       else -> return StorageResult.Failure(StorageError.UNSUPPORTED, "Not a cloud provider: $provider")
     }
 
+    val authParams = linkedMapOf(
+      "response_type" to "code",
+      "client_id" to publicClientId,
+      "redirect_uri" to CloudProviderScopes.REDIRECT_URI,
+      "code_challenge" to challengeS256,
+      "code_challenge_method" to "S256",
+      "state" to state,
+      "scope" to scopes.joinToString(" "),
+    )
+    when (provider) {
+      StorageProvider.GOOGLE_DRIVE -> {
+        authParams["access_type"] = "offline"
+        authParams["prompt"] = "consent"
+      }
+      StorageProvider.DROPBOX -> {
+        authParams["token_access_type"] = "offline"
+      }
+      else -> Unit
+    }
+
     val url = buildAuthorizationUrl(
       endpoint = authEndpoint,
-      params = linkedMapOf(
-        "response_type" to "code",
-        "client_id" to publicClientId,
-        "redirect_uri" to CloudProviderScopes.REDIRECT_URI,
-        "code_challenge" to challengeS256,
-        "code_challenge_method" to "S256",
-        "state" to state,
-        "scope" to scopes.joinToString(" "),
-      ),
+      params = authParams,
     )
 
     val req = PkceAuthRequest(
@@ -382,6 +394,9 @@ class CloudAuthCoordinator(
     }
     return StorageResult.Success(req)
   }
+
+  internal fun inspectCachedAccessTokenBytesForTesting(accountVaultKey: VaultKey): ByteArray? =
+    cachedAccessTokens[accountVaultKey]?.tokenBytes
 
   suspend fun completeRedirectCallback(
     accountVaultKey: VaultKey,
@@ -423,10 +438,15 @@ class CloudAuthCoordinator(
     if (saveRes is StorageResult.Failure) return saveRes
 
     reauthRequiredAccounts.remove(accountVaultKey)
-    cachedAccessTokens[accountVaultKey] = CachedAccessToken(
-      tokenBytes = response.accessTokenBytes.copyOf(),
-      expiresAtEpochMillis = clockEpochMillis() + (response.expiresInSeconds * 1000L) - 30_000L,
+    val previousCached = cachedAccessTokens.put(
+      accountVaultKey,
+      CachedAccessToken(
+        tokenBytes = response.accessTokenBytes.copyOf(),
+        expiresAtEpochMillis = clockEpochMillis() + (response.expiresInSeconds * 1000L) - 30_000L,
+      )
     )
+    previousCached?.tokenBytes?.fill(0)
+    response.accessTokenBytes.fill(0)
     return StorageResult.Success(Unit)
   }
 
@@ -502,11 +522,17 @@ class CloudAuthCoordinator(
               )
             }
           }
-          cachedAccessTokens[accountVaultKey] = CachedAccessToken(
-            tokenBytes = newAccess.copyOf(),
-            expiresAtEpochMillis = recheckNow + (exchange.expiresInSeconds * 1000L) - 30_000L,
+          val replaced = cachedAccessTokens.put(
+            accountVaultKey,
+            CachedAccessToken(
+              tokenBytes = newAccess.copyOf(),
+              expiresAtEpochMillis = recheckNow + (exchange.expiresInSeconds * 1000L) - 30_000L,
+            )
           )
-          StorageResult.Success(SecretBytes(newAccess.copyOf()))
+          replaced?.tokenBytes?.fill(0)
+          val resultCopy = newAccess.copyOf()
+          newAccess.fill(0)
+          StorageResult.Success(SecretBytes(resultCopy))
         }
         TokenRefreshOutcome.INVALID_GRANT_REVOKED -> {
           // Latch NEEDS_REAUTH so we never cause a retry storm (§8.8, §11)
@@ -582,9 +608,11 @@ class CloudIdTreeBackend(
   private val authCoordinator: CloudAuthCoordinator,
   override val isReadOnly: Boolean = false,
   uploadRegistry: CloudUploadRegistry? = null,
+  private val restHttp: HttpTransport? = null,
 ) : FileBackend {
 
-  val isRestWireStubbed: Boolean = true
+  val isRestWireStubbed: Boolean
+    get() = restHttp == null
   override val maxWriteSizeBytes: Long
     get() = when (provider) {
       StorageProvider.GOOGLE_DRIVE -> uploads.maxObjectBytes(CloudProvider.GOOGLE_DRIVE)
@@ -594,7 +622,7 @@ class CloudIdTreeBackend(
     }
   private val itemsById = ConcurrentHashMap<String, CloudItemNode>()
   private val uploads = uploadRegistry ?: CloudUploadRegistry.production(
-    http = OkHttpUploadTransport(),
+    http = restHttp ?: OkHttpUploadTransport(),
     tokens = { cloudProvider ->
       TokenProvider {
         val storageProvider = when (cloudProvider) {
@@ -629,19 +657,29 @@ class CloudIdTreeBackend(
     itemsById[node.itemId] = node
   }
 
-  private suspend fun checkAuthAndStatus(): StorageResult<Unit> {
+  private suspend fun checkAuthAndStatus(): StorageResult<String> {
     val tokenRes = authCoordinator.getValidAccessToken(accountVaultKey, provider, publicClientId)
     if (tokenRes is StorageResult.Failure) return tokenRes
-    (tokenRes as StorageResult.Success).value.close()
+    val bearer = (tokenRes as StorageResult.Success).value.useBytes { String(it, Charsets.UTF_8) }
 
     return when (simulatedHttpStatus) {
-      200, 201, 204 -> StorageResult.Success(Unit)
+      200, 201, 204 -> StorageResult.Success(bearer)
       401 -> StorageResult.Failure(StorageError.AUTH_REQUIRED, "$provider returned 401 Unauthorized")
       403 -> StorageResult.Failure(StorageError.DENIED, "$provider returned 403 Forbidden")
       429 -> StorageResult.Failure(StorageError.RATE_LIMITED, "$provider returned 429 Too Many Requests (Retry-After)")
       503 -> StorageResult.Failure(StorageError.UNAVAILABLE, "$provider service unavailable")
       else -> StorageResult.Failure(StorageError.INTERNAL, "$provider HTTP $simulatedHttpStatus")
     }
+  }
+
+  private fun mapHttpFailure(status: Int): StorageResult.Failure = when (status) {
+    401 -> StorageResult.Failure(StorageError.AUTH_REQUIRED, "$provider HTTP 401")
+    403 -> StorageResult.Failure(StorageError.DENIED, "$provider HTTP 403")
+    404 -> StorageResult.Failure(StorageError.NOT_FOUND, "$provider HTTP 404")
+    409 -> StorageResult.Failure(StorageError.EXISTS, "$provider HTTP 409")
+    429 -> StorageResult.Failure(StorageError.RATE_LIMITED, "$provider HTTP 429")
+    in 500..599 -> StorageResult.Failure(StorageError.UNAVAILABLE, "$provider HTTP $status")
+    else -> StorageResult.Failure(StorageError.INTERNAL, "$provider HTTP $status")
   }
 
   private fun resolveByIdHopByHop(path: SafePath): StorageResult<CloudItemNode> {
@@ -720,6 +758,7 @@ class CloudIdTreeBackend(
     }
     val auth = checkAuthAndStatus()
     if (auth is StorageResult.Failure) throw StorageException(auth.error, auth.message)
+    val bearer = (auth as StorageResult.Success).value
     val resolved = resolveByIdHopByHop(path)
     if (resolved is StorageResult.Failure) throw StorageException(resolved.error, resolved.message)
     val node = (resolved as StorageResult.Success).value
@@ -727,7 +766,54 @@ class CloudIdTreeBackend(
     if (provider == StorageProvider.GOOGLE_DRIVE && node.mimeType.startsWith("application/vnd.google-apps.")) {
       throw StorageException(StorageError.UNSUPPORTED, "Google-native doc cannot be streamed as raw bytes")
     }
-    throw StorageException(StorageError.UNAVAILABLE, "Cloud download adapter is unavailable")
+    val http = restHttp ?: throw StorageException(StorageError.UNAVAILABLE, "Cloud download adapter is unavailable")
+    val headers = LinkedHashMap<String, String>()
+    headers["Authorization"] = "Bearer $bearer"
+    if (offset > 0L || length > 0L) {
+      val rangeEnd = if (length > 0L) (offset + length - 1).toString() else ""
+      headers["Range"] = "bytes=$offset-$rangeEnd"
+    }
+    val request = when (provider) {
+      StorageProvider.GOOGLE_DRIVE -> HttpRequest(
+        method = "GET",
+        url = "https://www.googleapis.com/drive/v3/files/${node.itemId}?alt=media",
+        headers = headers,
+      )
+      StorageProvider.ONEDRIVE -> HttpRequest(
+        method = "GET",
+        url = "https://graph.microsoft.com/v1.0/me/drive/items/${node.itemId}/content",
+        headers = headers,
+      )
+      StorageProvider.DROPBOX -> {
+        val remotePath = "/" + path.segments.joinToString("/")
+        headers["Dropbox-API-Arg"] = """{"path":"$remotePath"}"""
+        HttpRequest(
+          method = "POST",
+          url = "https://content.dropboxapi.com/2/files/download",
+          headers = headers,
+        )
+      }
+      else -> throw StorageException(StorageError.UNSUPPORTED, "Not a cloud provider: $provider")
+    }
+    val response = try {
+      http.execute(request)
+    } catch (ce: CancellationException) {
+      throw ce
+    } catch (e: Exception) {
+      throw StorageException(StorageError.UNAVAILABLE, "Cloud download request failed")
+    }
+    if (response.status !in listOf(200, 206)) {
+      val failure = mapHttpFailure(response.status)
+      throw StorageException(failure.error, failure.message)
+    }
+    val bytes = response.body
+    val chunkSize = 64 * 1024
+    var pos = 0
+    while (pos < bytes.size) {
+      val end = minOf(pos + chunkSize, bytes.size)
+      emit(bytes.copyOfRange(pos, end))
+      pos = end
+    }
   }
 
   override suspend fun write(

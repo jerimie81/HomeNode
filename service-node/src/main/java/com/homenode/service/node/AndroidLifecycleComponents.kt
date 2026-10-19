@@ -7,8 +7,11 @@ import android.app.Service
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import com.homenode.storage.network.LanStorageAddressPolicy
 import java.io.File
 import java.net.Inet4Address
@@ -74,9 +77,42 @@ class DesiredNodeStateStore(private val stateDir: File) {
  * - Holds Wi-Fi / CPU locks only while active peer transfers or sessions exist.
  * - Holds a multicast lock only during foreground user-initiated network discovery.
  */
-class LockManager {
+class LockManager(private val appContext: Context? = null) {
   private val activeSessionRefCount = AtomicInteger(0)
   private val discoveryMulticastActive = AtomicInteger(0)
+
+  private val wakeLock: PowerManager.WakeLock? by lazy {
+    runCatching {
+      val pm = appContext?.applicationContext?.getSystemService(Context.POWER_SERVICE) as? PowerManager
+      pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HomeNode::SessionWakeLock")?.apply {
+        setReferenceCounted(false)
+      }
+    }.getOrNull()
+  }
+
+  @Suppress("DEPRECATION")
+  private val wifiLock: WifiManager.WifiLock? by lazy {
+    runCatching {
+      val wm = appContext?.applicationContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+      val mode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+      } else {
+        WifiManager.WIFI_MODE_FULL_HIGH_PERF
+      }
+      wm?.createWifiLock(mode, "HomeNode::SessionWifiLock")?.apply {
+        setReferenceCounted(false)
+      }
+    }.getOrNull()
+  }
+
+  private val multicastLock: WifiManager.MulticastLock? by lazy {
+    runCatching {
+      val wm = appContext?.applicationContext?.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+      wm?.createMulticastLock("HomeNode::DiscoveryMulticastLock")?.apply {
+        setReferenceCounted(false)
+      }
+    }.getOrNull()
+  }
 
   val isTransferLockHeld: Boolean
     get() = activeSessionRefCount.get() > 0
@@ -84,22 +120,49 @@ class LockManager {
   val isMulticastLockHeld: Boolean
     get() = discoveryMulticastActive.get() > 0
 
-  fun acquireSessionLock(): Int = activeSessionRefCount.incrementAndGet()
+  @Synchronized
+  fun acquireSessionLock(): Int {
+    val count = activeSessionRefCount.incrementAndGet()
+    if (count == 1) {
+      runCatching { if (wakeLock?.isHeld == false) wakeLock?.acquire(15 * 60 * 1000L) }
+      runCatching { if (wifiLock?.isHeld == false) wifiLock?.acquire() }
+    }
+    return count
+  }
 
-  fun releaseSessionLock(): Int =
-    activeSessionRefCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+  @Synchronized
+  fun releaseSessionLock(): Int {
+    val count = activeSessionRefCount.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    if (count == 0) {
+      runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+      runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+    }
+    return count
+  }
 
+  @Synchronized
   fun acquireDiscoveryMulticastLock() {
-    discoveryMulticastActive.incrementAndGet()
+    val count = discoveryMulticastActive.incrementAndGet()
+    if (count == 1) {
+      runCatching { if (multicastLock?.isHeld == false) multicastLock?.acquire() }
+    }
   }
 
+  @Synchronized
   fun releaseDiscoveryMulticastLock() {
-    discoveryMulticastActive.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    val count = discoveryMulticastActive.updateAndGet { current -> (current - 1).coerceAtLeast(0) }
+    if (count == 0) {
+      runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
+    }
   }
 
+  @Synchronized
   fun forceReleaseAll() {
     activeSessionRefCount.set(0)
     discoveryMulticastActive.set(0)
+    runCatching { if (wakeLock?.isHeld == true) wakeLock?.release() }
+    runCatching { if (wifiLock?.isHeld == true) wifiLock?.release() }
+    runCatching { if (multicastLock?.isHeld == true) multicastLock?.release() }
   }
 }
 
@@ -130,8 +193,12 @@ class NodeService : Service() {
     store.setDesiredRunning(true)
     ensureNotificationChannel()
     val notification = buildForegroundNotification()
-    // API 28 (Android 9 on Galaxy S8+) uses 2-argument startForeground without foregroundServiceType (§2, ADR-006)
-    startForeground(NOTIFICATION_ID, notification)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+    } else {
+      // API 28 (Android 9 on Galaxy S8+) uses 2-argument startForeground without foregroundServiceType (§2, ADR-006)
+      startForeground(NOTIFICATION_ID, notification)
+    }
     registeredFacade?.startNodeFromService()
     return START_STICKY
   }

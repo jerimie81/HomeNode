@@ -4,9 +4,15 @@ package com.homenode.storage.cloud
  * Production registry. There is deliberately NO default/in-memory fallback:
  * a provider without a configured adapter throws ProviderUnavailable.
  */
-class CloudUploadRegistry(private val adapters: Map<CloudProvider, CloudUploadAdapter>) {
+class CloudUploadRegistry(
+    private val adapters: Map<CloudProvider, CloudUploadAdapter>,
+    private val maxTransientRetries: Int = 2,
+) {
     fun uploaderFor(provider: CloudProvider): StreamingUploader =
-        StreamingUploader(adapters[provider] ?: throw UploadException.ProviderUnavailable(provider))
+        StreamingUploader(
+            adapter = adapters[provider] ?: throw UploadException.ProviderUnavailable(provider),
+            maxTransientRetries = maxTransientRetries,
+        )
 
     fun maxObjectBytes(provider: CloudProvider): Long = adapters[provider]?.maxObjectBytes ?: 0L
 
@@ -19,3 +25,4 @@ class CloudUploadRegistry(private val adapters: Map<CloudProvider, CloudUploadAd
             return CloudUploadRegistry(m)
         }
     }
+}

@@ -314,6 +314,7 @@ class ServiceNodeTest {
 
     val snapStopped = runtime.stop()
     assertEquals(NodeState.STOPPED, snapStopped.state)
+    mountManager.markMountReady(cloudMount.id)
     val restarted = runtime.start()
     assertEquals(NodeState.RUNNING, restarted.state)
     assertEquals(restarted.identity!!.publicKey.base64Url, transport.localPublicKey.base64Url)
@@ -416,5 +417,122 @@ class ServiceNodeTest {
     // Switching back to readOnly = false while WRITE permission is still missing transitions back to NeedsReauth
     val rwAgain = mountManager.setMountReadOnly(rwMount.id, readOnly = false).getOrThrow()
     assertEquals(MountState.NeedsReauth, rwAgain.state)
+  }
+
+  @Test
+  fun operationalStateStore_persistsPeersMountsLanDestinationsRetainsRevokedPeersAndFailsClosedOnCorruption() = runTest {
+    val testDispatcher = StandardTestDispatcher(testScheduler)
+    val dir = Files.createTempDirectory("homenode_state_store_test").toFile()
+    val wrapper = SoftwareAesGcmTestWrapper()
+    val vault = KeystoreCredentialVault(dir, wrapper)
+    val stateStore = NodeOperationalStateStore(vault, dir)
+
+    val identityMgr1 = NodeIdentityManager(dir, vault)
+    val authorizer1 = PeerAuthorizer()
+    val logger1 = SafeEventLogger()
+    val scheduler1 = ComponentRetryScheduler(logger1)
+    val cloudAuth1 = CloudAuthCoordinator(vault, dummyOAuthEndpoint())
+    val mountManager1 = MountManager(vault, authorizer1, cloudAuth1, scheduler1, logger1)
+    val lanProxy1 = LanProxy(authorizer1, logger1)
+    val transportIp = TunnelIp.parse("10.66.0.1").getOrThrow()
+    val wgTransport1 = IdentityBoundTransport(
+      mode = TransportSelectionMode.PRODUCTION_WIREGUARD,
+      localTunnelIp = transportIp,
+    ) { idKey -> com.homenode.core.transport.WireGuardTransport(idKey, transportIp, listenPort = 0) }
+
+    val runtime1 = NodeRuntime(
+      identityManager = identityMgr1,
+      transport = wgTransport1,
+      reachability = FakeReachability(),
+      mountManager = mountManager1,
+      authorizer = authorizer1,
+      lanProxy = lanProxy1,
+      logger = logger1,
+      retryScheduler = scheduler1,
+      dispatcher = testDispatcher,
+      vault = vault,
+      operationalStateStore = stateStore,
+    )
+
+    val snap1 = runtime1.start()
+    assertEquals(NodeState.RUNNING, snap1.state)
+    assertEquals(
+      com.homenode.core.transport.TransportImplementationStatus.REAL,
+      wgTransport1.implementationStatus,
+    )
+    // Verify byte-for-byte public key equality between NodeIdentityManager, Pairing QR, and Transport
+    val pairingCoordinator = com.homenode.core.identity.ModeAPairingCoordinator(authorizer1)
+    val qrPayload = pairingCoordinator.createNodeIntroductionQr(snap1.identity!!, listOf("192.168.1.10:51820"))
+    assertArrayEquals(snap1.identity!!.publicKey.toBytes(), wgTransport1.localPublicKey.toByteArray())
+    assertArrayEquals(qrPayload.publicKey.toBytes(), wgTransport1.localPublicKey.toByteArray())
+
+    val mount = mountManager1.addMount(
+      label = "Persisted NAS",
+      provider = StorageProvider.SMB,
+      config = MountConfig.SmbConfig("192.168.1.50", 445, "share", "alice"),
+      readOnly = false,
+      initialSecret = SecretBytes("pw".encodeToByteArray()),
+    ).getOrThrow()
+    val dest = lanProxy1.addAllowlistedDestination(DestinationId("nas_admin"), "NAS Admin", "192.168.1.50", 8080).getOrThrow()
+
+    val (_, activePeer) = NodeIdentityManager.generateEphemeralKeypair()
+    val (_, revokedPeer) = NodeIdentityManager.generateEphemeralKeypair()
+    authorizer1.registerOrUpdatePeer(
+      peerId = activePeer,
+      label = "Laptop",
+      capabilities = setOf(Capability.Files(mount.id, AccessMode.READ), Capability.Lan(dest.id)),
+      endpointHints = listOf("192.168.1.99:51820"),
+    )
+    authorizer1.registerOrUpdatePeer(revokedPeer, "Lost Phone", setOf(Capability.Files(mount.id, AccessMode.WRITE)))
+    authorizer1.revokePeer(revokedPeer)
+
+    assertTrue(
+      stateStore.save(
+        PersistedOperationalState(
+          peers = authorizer1.listPeers(),
+          mounts = mountManager1.listMounts(),
+          lanDestinations = lanProxy1.destinationsFlow.value,
+        )
+      ).isSuccess
+    )
+    runtime1.stop()
+
+    // Create a brand new runtime instance simulating process restart/reboot
+    val authorizer2 = PeerAuthorizer()
+    val logger2 = SafeEventLogger()
+    val scheduler2 = ComponentRetryScheduler(logger2)
+    val mountManager2 = MountManager(vault, authorizer2, cloudAuth1, scheduler2, logger2)
+    val lanProxy2 = LanProxy(authorizer2, logger2)
+    val wgTransport2 = IdentityBoundTransport(
+      mode = TransportSelectionMode.PRODUCTION_WIREGUARD,
+      localTunnelIp = transportIp,
+    ) { idKey -> com.homenode.core.transport.WireGuardTransport(idKey, transportIp, listenPort = 0) }
+    val runtime2 = NodeRuntime(
+      identityManager = NodeIdentityManager(dir, vault),
+      transport = wgTransport2,
+      reachability = FakeReachability(),
+      mountManager = mountManager2,
+      authorizer = authorizer2,
+      lanProxy = lanProxy2,
+      logger = logger2,
+      retryScheduler = scheduler2,
+      dispatcher = testDispatcher,
+      vault = vault,
+      operationalStateStore = stateStore,
+    )
+
+    val snap2 = runtime2.start()
+    assertEquals(NodeState.RUNNING, snap2.state)
+    assertTrue(authorizer2.can(activePeer, Capability.Files(mount.id, AccessMode.READ)))
+    assertTrue(authorizer2.can(activePeer, Capability.Lan(dest.id)))
+    assertFalse("Revoked peer must remain revoked after reboot", authorizer2.can(revokedPeer, Capability.Files(mount.id, AccessMode.READ)))
+    assertEquals(1, mountManager2.listMounts().size)
+    assertEquals(1, lanProxy2.destinationsFlow.value.size)
+    runtime2.stop()
+
+    // Corrupting the operational state vault entry must cause NodeRuntime.start() to fail closed (NodeState.FAILED)
+    vault.put(NodeOperationalStateStore.STATE_VAULT_KEY, SecretBytes(byteArrayOf(0, 1, 2, 3)))
+    val failedSnap = runtime2.start()
+    assertEquals(NodeState.FAILED, failedSnap.state)
   }
 }

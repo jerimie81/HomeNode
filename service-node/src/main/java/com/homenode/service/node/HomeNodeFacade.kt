@@ -197,11 +197,12 @@ class HomeNodeFacade(
   private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
   private val vaultDir = File(storageDir, "no_backup_vault")
   val vault = KeystoreCredentialVault(vaultDir, keyWrapper)
+  private val operationalStateStore = NodeOperationalStateStore(vault, vaultDir)
   private val identityManager = NodeIdentityManager(vaultDir, vault)
   private val authorizer = PeerAuthorizer()
   private val logger = SafeEventLogger()
   private val retryScheduler = ComponentRetryScheduler(logger)
-  private val lockManager = LockManager()
+  private val lockManager = LockManager(appContext)
 
   private val cloudAuth = CloudAuthCoordinator(vault, oauthEndpoint)
   private val hub = TestTransportHub()
@@ -276,6 +277,8 @@ class HomeNodeFacade(
     lanProxy = lanProxy,
     logger = logger,
     retryScheduler = retryScheduler,
+    vault = vault,
+    operationalStateStore = operationalStateStore,
   )
 
   private var discoveredCache: List<DiscoveredCandidateUi> = emptyList()
@@ -293,11 +296,24 @@ class HomeNodeFacade(
 
   init {
     NodeService.registerFacade(this)
+    refreshUiState()
     scope.launch {
       runtime.start()
       generateFreshPairingQrInternal()
       runAllThreatModelChecks()
       refreshUiState()
+    }
+  }
+
+  private suspend fun persistOperationalState() {
+    runCatching {
+      operationalStateStore.save(
+        PersistedOperationalState(
+          peers = authorizer.listPeers(),
+          mounts = mountManager.listMounts(),
+          lanDestinations = lanProxy.destinationsFlow.value,
+        )
+      )
     }
   }
 
@@ -374,6 +390,7 @@ class HomeNodeFacade(
         config = MountConfig.SafConfig(treeUriString, isRemovableStorage = isMicroSd),
         readOnly = readOnly,
       )
+      persistOperationalState()
       latestFeedback = when (res) {
         is StorageResult.Success -> "Mounted real SAF Document Tree '${res.value.label}' (/${res.value.id.value})"
         is StorageResult.Failure -> "Rejected SAF mount: ${res.message}"
@@ -399,6 +416,7 @@ class HomeNodeFacade(
         config = MountConfig.SafConfig(treeUri, isRemovableStorage = isMicroSd),
         readOnly = readOnly,
       )
+      persistOperationalState()
       latestFeedback = when (res) {
         is StorageResult.Success ->
           "Added simulated SAF mount '${res.value.label}' (FakeSafTreeAdapter active; use 'Select Real Folder (SAF)' on device)"
@@ -454,6 +472,7 @@ class HomeNodeFacade(
         readOnly = readOnly,
         initialSecret = SecretBytes(password.ifEmpty { "vault-wrapped-secret" }.encodeToByteArray()),
       )
+      persistOperationalState()
       latestFeedback = when (res) {
         is StorageResult.Success ->
           "Added ${provider.name} mount @ $hostIpLiteral:$port (/${res.value.id.value}; wire adapter stubbed — see SIMULATION banner)"
@@ -500,6 +519,7 @@ class HomeNodeFacade(
           accountDisplayName = accountLabel,
           rootFolderId = "root_${provider.name.lowercase()}",
           isAppFolderScopeOnly = appFolderOnly,
+          publicClientId = configuredClientId,
         ),
         readOnly = readOnly,
         initialState = MountState.NeedsReauth,
@@ -508,6 +528,7 @@ class HomeNodeFacade(
         pendingCloudMountId = mountRes.value.id
         pendingCloudMountCredKey = mountRes.value.credentialRef
         runtime.refreshMountHealthState()
+        persistOperationalState()
         latestFeedback =
           "Launching system browser for ${provider.name} PKCE login (Mount awaits real OAuth redirect callback)"
       }
@@ -547,11 +568,13 @@ class HomeNodeFacade(
         is StorageResult.Success -> {
           mountManager.markMountReady(mountId)
           runtime.refreshMountHealthState()
+          persistOperationalState()
           latestFeedback = "OAuth 2.0 + PKCE token exchange succeeded; cloud mount is now READY"
         }
         is StorageResult.Failure -> {
           mountManager.reportMountIssue(scope, mountId, MountState.NeedsReauth)
           runtime.refreshMountHealthState()
+          persistOperationalState()
           latestFeedback = "OAuth 2.0 code exchange failed (${res.message}); mount remains in NEEDS_REAUTH"
         }
       }
@@ -563,6 +586,7 @@ class HomeNodeFacade(
     scope.launch {
       val id = MountId.parse(mountIdRaw).getOrNull() ?: return@launch
       mountManager.setMountReadOnly(id, readOnly)
+      persistOperationalState()
       latestFeedback = "Mount $mountIdRaw readOnly set to $readOnly"
       refreshUiState()
     }
@@ -580,6 +604,7 @@ class HomeNodeFacade(
         latestFeedback = "Mount ${current.label} marked NEEDS_REAUTH (auto-retry suppressed to prevent retry storm)"
       }
       runtime.refreshMountHealthState()
+      persistOperationalState()
       refreshUiState()
     }
   }
@@ -589,6 +614,7 @@ class HomeNodeFacade(
       val id = MountId.parse(mountIdRaw).getOrNull() ?: return@launch
       mountManager.removeMount(id)
       runtime.refreshMountHealthState()
+      persistOperationalState()
       latestFeedback = "Removed mount $mountIdRaw, revoked peer grants & wiped CredentialVault entry"
       refreshUiState()
     }
@@ -649,6 +675,7 @@ class HomeNodeFacade(
       } else {
         authorizer.revokeCapability(peerId, cap)
       }
+      persistOperationalState()
       latestFeedback = "${if (enabled) "Granted" else "Revoked"} ${mode.name} on $mountIdRaw for peer ${peerId.shortId}"
       refreshUiState()
     }
@@ -668,6 +695,7 @@ class HomeNodeFacade(
       } else {
         authorizer.revokeCapability(peerId, cap)
       }
+      persistOperationalState()
       latestFeedback = "${if (enabled) "Granted" else "Revoked"} LAN(${destId.value}) for peer ${peerId.shortId}"
       refreshUiState()
     }
@@ -719,9 +747,11 @@ class HomeNodeFacade(
             refreshUiState()
             return@launch
           }
-          when (val transportRes = transport.addPeer(PeerEndpointConfig(peerKey, tunnelIp))) {
+          val endpointHint = res.value.endpointHints.firstOrNull()
+          when (val transportRes = transport.addPeer(PeerEndpointConfig(peerKey, tunnelIp, endpointHint))) {
             is com.homenode.core.transport.TransportResult.Success -> {
               logger.logPeerAdded(res.value.peerId.shortId)
+              persistOperationalState()
               latestFeedback =
                 "Paired '${res.value.label}' (X25519 ${res.value.peerId.shortId}… · ${res.value.tunnelCidr32}); cloud mounts excluded from default grant"
               generateFreshPairingQrInternal()
@@ -747,6 +777,7 @@ class HomeNodeFacade(
       PeerPublicKey.fromBase64Url(peerIdBase64).getOrElse { null }?.let {
         transport.removePeer(it)
       }
+      persistOperationalState()
       logger.logPeerRemoved(peerId.shortId)
       latestFeedback = "Revoked peer ${peerId.shortId} and tore down active tunnel streams"
       refreshUiState()
@@ -761,6 +792,7 @@ class HomeNodeFacade(
         return@launch
       }
       val res = lanProxy.addAllowlistedDestination(id, label, hostIpLiteral.trim(), port)
+      persistOperationalState()
       latestFeedback = when (res) {
         is StorageResult.Success -> "Allowlisted LAN destination '${res.value.label}' (${res.value.hostIpLiteral}:$port)"
         is StorageResult.Failure -> "LanPolicy rejected target: ${res.message}"
@@ -773,6 +805,7 @@ class HomeNodeFacade(
     scope.launch {
       val id = runCatching { DestinationId(idRaw) }.getOrNull() ?: return@launch
       lanProxy.removeDestination(id)
+      persistOperationalState()
       latestFeedback = "Removed LAN destination $idRaw"
       refreshUiState()
     }

@@ -312,4 +312,86 @@ class CloudAuthAndBackendsTest {
     )
     assertEquals(StorageError.UNAVAILABLE, (unavailableWrite as StorageResult.Failure).error)
   }
+
+  @Test
+  fun oauthPkce_includesOfflineAccessParamsZeroesReplacedCachedAccessTokensAndStreamsRangeDownloads() = runTest {
+    var now = 5_000L
+    val vault = InMemoryCredentialVault()
+    var refreshIdx = 0
+    val endpoint = object : OAuthTokenEndpointAdapter {
+      override suspend fun exchangeCodeWithPkce(
+        provider: StorageProvider,
+        publicClientId: String,
+        redirectUri: String,
+        authorizationCode: String,
+        codeVerifierBytes: ByteArray,
+      ) = TokenExchangeResponse(
+        TokenRefreshOutcome.SUCCESS,
+        "initial-token-bytes".encodeToByteArray(),
+        "refresh-token-1".encodeToByteArray(),
+        60L,
+      )
+
+      override suspend fun refreshAccessToken(
+        provider: StorageProvider,
+        publicClientId: String,
+        refreshTokenBytes: ByteArray,
+      ) = TokenExchangeResponse(
+        TokenRefreshOutcome.SUCCESS,
+        "rotated-token-${++refreshIdx}".encodeToByteArray(),
+        "refresh-token-2".encodeToByteArray(),
+        60L,
+      )
+
+      override suspend fun revokeTokenAtProvider(provider: StorageProvider, tokenBytes: ByteArray) = true
+    }
+
+    val auth = CloudAuthCoordinator(vault, endpoint) { now }
+    val gdriveReq = auth.startSystemBrowserPkceFlow(StorageProvider.GOOGLE_DRIVE, "g-client").getOrThrow()
+    assertTrue(gdriveReq.systemBrowserAuthorizationUrl.contains("access_type=offline"))
+    assertTrue(gdriveReq.systemBrowserAuthorizationUrl.contains("prompt=consent"))
+
+    val dropboxReq = auth.startSystemBrowserPkceFlow(StorageProvider.DROPBOX, "d-client").getOrThrow()
+    assertTrue(dropboxReq.systemBrowserAuthorizationUrl.contains("token_access_type=offline"))
+
+    val key = VaultKey("cloud.gdrive.zero")
+    assertTrue(
+      auth.completeRedirectCallback(key, CloudProviderScopes.REDIRECT_URI, gdriveReq.state, "auth-code").isSuccess
+    )
+    val initialRef = auth.inspectCachedAccessTokenBytesForTesting(key)!!
+    assertTrue(initialRef.any { it != 0.toByte() })
+
+    now += 61_000L
+    val refreshed = auth.getValidAccessToken(key, StorageProvider.GOOGLE_DRIVE, "g-client").getOrThrow()
+    refreshed.close()
+    assertTrue("Replaced cached access token array must be zeroed in place", initialRef.all { it == 0.toByte() })
+
+    val fakeHttp = FakeHttp { req ->
+      assertEquals("GET", req.method)
+      assertEquals("bytes=4-9", req.headers["Range"])
+      HttpResponse(206, body = "456789".encodeToByteArray())
+    }
+    val backend = CloudIdTreeBackend(
+      provider = StorageProvider.GOOGLE_DRIVE,
+      accountVaultKey = key,
+      publicClientId = "g-client",
+      rootFolderId = "root",
+      authCoordinator = auth,
+      restHttp = fakeHttp,
+    )
+    backend.injectItemForTesting(
+      CloudItemNode(
+        itemId = "file-123",
+        parentItemId = "root",
+        name = "sample.bin",
+        isFolder = false,
+        sizeBytes = 16L,
+      )
+    )
+    val chunks = mutableListOf<ByteArray>()
+    backend.open(PathValidator.parseRelative("sample.bin").getOrThrow(), offset = 4L, length = 6L)
+      .collect { chunks += it }
+    val downloaded = chunks.fold(ByteArray(0)) { acc, b -> acc + b }
+    assertEquals("456789", String(downloaded, Charsets.UTF_8))
+  }
 }

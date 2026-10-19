@@ -40,7 +40,7 @@ class AndroidContentResolverSafTreeAdapter(
   override fun isMediaMounted(): Boolean {
     return try {
       val storageManager = context.getSystemService(StorageManager::class.java)
-      if (storageManager != null) {
+      if (storageManager != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocumentId)
         val volume = runCatching { storageManager.getStorageVolume(docUri) }.getOrNull()
         if (volume != null) {
@@ -67,7 +67,7 @@ class AndroidContentResolverSafTreeAdapter(
     val parentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, parentDocumentId)
     val candidateUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, candidateDocumentId)
     return try {
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
         if (DocumentsContract.isChildDocument(contentResolver, parentUri, candidateUri)) {
           return true
         }
@@ -315,7 +315,7 @@ class AndroidContentResolverSafTreeAdapter(
     }
 
     var currentDocUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, documentId)
-    if (sourceParentDocId != targetParentDocId && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+    if (sourceParentDocId != targetParentDocId) {
       val srcParentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, sourceParentDocId)
       val dstParentUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, targetParentDocId)
       currentDocUri = DocumentsContract.moveDocument(

@@ -213,4 +213,117 @@ class TransportAndReachabilityTest {
     assertTrue(kernelRep.throughputMiBPerSec > 0.0)
     assertTrue(kernelRep.occupiesAndroidVpnSlot)
   }
+
+  @Test
+  fun wireGuardTransport_realUserspaceUdpEngineConnectsStreamsEnforcesCryptokeyAndRevokesPeer() = runTest {
+    val rng = java.security.SecureRandom()
+    val nodePriv = ByteArray(32).also { org.bouncycastle.math.ec.rfc7748.X25519.generatePrivateKey(rng, it) }
+    val nodePubBytes = ByteArray(32).also { org.bouncycastle.math.ec.rfc7748.X25519.scalarMultBase(nodePriv, 0, it, 0) }
+    val nodeKey = PeerPublicKey.fromBytes(nodePubBytes).getOrThrow()
+
+    val peerPriv = ByteArray(32).also { org.bouncycastle.math.ec.rfc7748.X25519.generatePrivateKey(rng, it) }
+    val peerPubBytes = ByteArray(32).also { org.bouncycastle.math.ec.rfc7748.X25519.scalarMultBase(peerPriv, 0, it, 0) }
+    val peerKey = PeerPublicKey.fromBytes(peerPubBytes).getOrThrow()
+
+    val nodeIp = TunnelIp.parse("10.66.0.1").getOrThrow()
+    val peerIp = TunnelIp.parse("10.66.0.2").getOrThrow()
+
+    val nodeWg = WireGuardTransport(nodeKey, nodeIp, listenPort = 0)
+    val peerWg = WireGuardTransport(peerKey, peerIp, listenPort = 0)
+
+    // Unconfigured engine must fail closed on start()
+    assertTrue(nodeWg.isEngineStubbed)
+    assertTrue(nodeWg.start().isFailure)
+
+    // Mismatched private key must be rejected
+    assertTrue(nodeWg.configurePrivateKey(peerPriv).isFailure)
+    assertTrue(nodeWg.isEngineStubbed)
+
+    // Matching private keys activate the real userspace UDP WireGuard engine
+    assertTrue(nodeWg.configurePrivateKey(nodePriv).isSuccess)
+    assertTrue(peerWg.configurePrivateKey(peerPriv).isSuccess)
+    assertFalse(nodeWg.isEngineStubbed)
+    assertEquals(TransportImplementationStatus.REAL, nodeWg.implementationStatus)
+
+    assertTrue(nodeWg.start().isSuccess)
+    assertTrue(peerWg.start().isSuccess)
+    assertEquals(TransportState.RUNNING, nodeWg.state.value)
+    assertTrue(nodeWg.boundUdpPort > 0)
+    assertTrue(peerWg.boundUdpPort > 0)
+
+    // Register peers with their loopback UDP endpoints
+    assertTrue(
+      nodeWg.addPeer(PeerEndpointConfig(peerKey, peerIp, "127.0.0.1:${peerWg.boundUdpPort}")).isSuccess
+    )
+    assertTrue(
+      peerWg.addPeer(PeerEndpointConfig(nodeKey, nodeIp, "127.0.0.1:${nodeWg.boundUdpPort}")).isSuccess
+    )
+
+    val incomingFlow = nodeWg.listen(7001)
+    val serverJob = backgroundScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+      incomingFlow.collect { serverStream ->
+        assertEquals(peerKey, serverStream.remotePeer)
+        assertEquals(peerIp, serverStream.remoteTunnelIp)
+        val received = serverStream.readFrameBytes(4096).getOrThrow()
+        if (received != null) {
+          serverStream.writeFrameBytes("ACK:".encodeToByteArray() + received)
+        }
+      }
+    }
+
+    val clientStream = peerWg.openStream(nodeKey, 7001).getOrThrow()
+    val payload = "real-udp-wireguard-payload".encodeToByteArray()
+    assertTrue(clientStream.writeFrameBytes(payload).isSuccess)
+    val reply = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+      clientStream.readFrameBytes(4096).getOrThrow()
+    }
+    assertArrayEquals("ACK:".encodeToByteArray() + payload, reply)
+
+    // Revoking peer immediately tears down active stream
+    assertTrue(nodeWg.removePeer(peerKey).isSuccess)
+    serverJob.cancel()
+    nodeWg.stop()
+    peerWg.stop()
+  }
+
+  @Test
+  fun stunReachability_parsesRfc5389XorMappedAddressFromLoopbackServer() = runTest {
+    java.net.DatagramSocket(0, java.net.InetAddress.getByName("127.0.0.1")).use { stunServer ->
+      val serverPort = stunServer.localPort
+      val serverJob = backgroundScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        val buf = ByteArray(128)
+        val pkt = java.net.DatagramPacket(buf, buf.size)
+        stunServer.receive(pkt)
+        val txId = pkt.data.copyOfRange(8, 20)
+        // Build XOR-MAPPED-ADDRESS for 203.0.113.45:51820
+        val ipInt = (203 shl 24) or (0 shl 16) or (113 shl 8) or 45
+        val xorIp = ipInt xor StunReachability.STUN_MAGIC_COOKIE
+        val xorPort = 51820 xor (StunReachability.STUN_MAGIC_COOKIE ushr 16)
+        val resp = java.nio.ByteBuffer.allocate(32)
+          .putShort(StunReachability.STUN_BINDING_RESPONSE)
+          .putShort(12) // 12-byte attribute
+          .putInt(StunReachability.STUN_MAGIC_COOKIE)
+          .put(txId)
+          .putShort(StunReachability.ATTR_XOR_MAPPED_ADDRESS.toShort())
+          .putShort(8)
+          .put(0)
+          .put(1) // IPv4
+          .putShort(xorPort.toShort())
+          .putInt(xorIp)
+          .array()
+        stunServer.send(java.net.DatagramPacket(resp, resp.size, pkt.address, pkt.port))
+      }
+
+      val stun = StunReachability(
+        serverAddressProvider = { java.net.InetSocketAddress("127.0.0.1", serverPort) },
+        timeoutMs = 1000,
+      )
+      val hints = stun.discoverEndpoints(51820)
+      serverJob.cancel()
+      assertEquals(1, hints.size)
+      assertEquals("203.0.113.45", hints.first().hostIpLiteral)
+      assertEquals(51820, hints.first().port)
+      assertEquals(ReachabilityKind.STUN_REFLEXIVE, hints.first().kind)
+    }
+  }
 }

@@ -55,6 +55,9 @@ internal class IdentityBoundTransport(
     TransportError.EngineUnavailable("Transport is unavailable until persisted node identity is loaded")
   )
 
+  override fun configurePrivateKey(privateKey32: ByteArray): TransportResult<Unit> =
+    current()?.configurePrivateKey(privateKey32) ?: unavailable()
+
   override suspend fun start(): TransportResult<Unit> {
     val active = current() ?: return unavailable()
     return active.start()

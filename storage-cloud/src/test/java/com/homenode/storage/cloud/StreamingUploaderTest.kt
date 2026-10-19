@@ -128,6 +128,36 @@ class StreamingUploaderTest {
         val reg = CloudUploadRegistry.production(http = NoHttp, tokens = { null })
         for (p in CloudProvider.values()) assertFailsWith<UploadException.ProviderUnavailable> { reg.uploaderFor(p) }
     }
+
+    @Test fun transientErrorsAreRetriedWhenMaxTransientRetriesConfigured() = runTest {
+        var transientFailuresLeft = 2
+        val http = FakeHttp { request ->
+            when {
+                request.url.endsWith("upload_session/start") -> HttpResponse(200, body = """{"session_id":"s-retry"}""".toByteArray())
+                request.url.endsWith("upload_session/append_v2") -> {
+                    if (transientFailuresLeft > 0) {
+                        transientFailuresLeft--
+                        HttpResponse(503, body = "transient".toByteArray())
+                    } else {
+                        HttpResponse(200)
+                    }
+                }
+                else -> HttpResponse(200, body = """{"id":"d-retry","name":"f.bin","size":16777216}""".toByteArray())
+            }
+        }
+        val uploader = StreamingUploader(
+            adapter = DropboxUploadAdapter(http, TokenProvider { "tok" }),
+            maxTransientRetries = 2,
+            retryBackoffMillis = 1L,
+        )
+        val result = uploader.upload(
+            UploadTarget("root", "f.bin", remotePath = "/f.bin"),
+            16L * 1024 * 1024,
+            flow { emit(ByteArray(16 * 1024 * 1024)) },
+        )
+        assertEquals("d-retry", result.id)
+        assertEquals(0, transientFailuresLeft)
+    }
 }
 
 private object NoHttp : HttpTransport { override suspend fun execute(request: HttpRequest) = error("no network in tests") }

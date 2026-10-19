@@ -503,11 +503,14 @@ class FileServiceIntegrationTest {
         StorageMount(mountId, MountKind.LOCAL, StorageProvider.SAF, "Fast", MountConfig.SafConfig("content://a"), null, false, MountState.Ready),
         StorageMount(slowMountId, MountKind.LOCAL, StorageProvider.SAF, "Slow", MountConfig.SafConfig("content://b"), null, false, MountState.Ready),
       )
-      override fun getMount(id: MountId): StorageMount? = listMounts().firstOrNull { it.id == id }
-      override fun getBackend(id: MountId): FileBackend? = when (id) {
-        mountId -> fastBackend
-        slowMountId -> slowBackend
+      override fun getMount(mountId: MountId): StorageMount? = listMounts().firstOrNull { it.id == mountId }
+      override fun getBackend(mountId: MountId): FileBackend? = when (mountId) {
+        this@runTest.let { mountId } -> when (mountId) {
+          else -> null
+        }
         else -> null
+      }.let {
+        if (mountId == slowMountId) slowBackend else if (listMounts().any { m -> m.id == mountId }) fastBackend else null
       }
     }
 
@@ -660,7 +663,43 @@ class FileServiceIntegrationTest {
     val relPartial = com.homenode.core.storage.PathValidator.parseRelative("partial.bin").getOrThrow()
     assertTrue(fastBackend.stat(relPartial).isFailure)
 
+    // 5. Interleaved request ID during WRITE stream must fail closed with BAD_REQUEST without committing
+    val interleaveStream = peerTransport.openStream(nodeKey, FileService.FILE_SERVICE_PORT).getOrThrow()
+    negotiateHello(interleaveStream)
+    interleaveStream.writeFrameBytes(
+      FrameCodec.encodeFrame(
+        WireFrame(
+          FrameType.WRITE,
+          0,
+          190,
+          ProtocolV2PayloadCodec.encodeWriteReq(ProtocolMessage.WriteReq(partialPath, WriteMode.CREATE_NEW, 10L)),
+        ),
+      ),
+    )
+    // Send DATA with wrong requestId (191 instead of 190)
+    interleaveStream.writeFrameBytes(FrameCodec.encodeFrame(WireFrame(FrameType.DATA, 0, 191, ByteArray(5))))
+    val interleaveErr = (FrameCodec.decodeFrame(interleaveStream.readFrameBytes(65536).getOrThrow()!!) as CodecResult.Success).value
+    assertEquals(FrameType.ERROR, interleaveErr.type)
+    interleaveStream.close()
+    assertTrue(fastBackend.stat(relPartial).isFailure)
+
     stream.close()
     service.stop()
+  }
+
+  @Test
+  fun protocolCodec_rejectsTrailingBytesInvalidUtf8AndOversizedFields() {
+    // Trailing bytes after valid STAT payload must be rejected
+    val validStat = ProtocolV2PayloadCodec.encodeStatReq(ProtocolMessage.StatReq("/a"))
+    val withTrailing = validStat + byteArrayOf(0x7F)
+    assertTrue(ProtocolV2PayloadCodec.decodeStatReq(withTrailing) is CodecResult.Malformed)
+
+    // Invalid UTF-8 sequence (0xFF, 0xFE) in string field must be rejected
+    val badUtf8 = byteArrayOf(0, 2, 0xFF.toByte(), 0xFE.toByte())
+    assertTrue(ProtocolV2PayloadCodec.decodeStatReq(badUtf8) is CodecResult.Malformed)
+
+    // Truncated length prefix or oversized field length must be rejected
+    val oversizedLen = byteArrayOf(0x7F, 0xFF.toByte(), 0x41)
+    assertTrue(ProtocolV2PayloadCodec.decodeStatReq(oversizedLen) is CodecResult.Malformed)
   }
 }

@@ -180,6 +180,7 @@ interface Transport {
   val localPublicKey: PeerPublicKey
   val localTunnelIp: TunnelIp
 
+  fun configurePrivateKey(privateKey32: ByteArray): TransportResult<Unit> = TransportResult.Success(Unit)
   suspend fun start(): TransportResult<Unit>
   suspend fun stop(): TransportResult<Unit>
   suspend fun addPeer(config: PeerEndpointConfig): TransportResult<Unit>

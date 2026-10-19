@@ -6,6 +6,7 @@ import com.homenode.core.storage.Capability
 import com.homenode.core.storage.DestinationId
 import com.homenode.core.storage.StorageError
 import com.homenode.core.storage.StorageResult
+import com.homenode.core.transport.Transport
 import com.homenode.core.transport.TransportResult
 import com.homenode.core.transport.TransportStream
 import com.homenode.storage.network.LanStorageAddressPolicy
@@ -17,7 +18,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import javax.net.SocketFactory
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
@@ -25,6 +28,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 data class LanDestination(
@@ -63,6 +67,7 @@ class LanProxy(
   private val peerConnectionTimestamps = ConcurrentHashMap<PeerId, MutableList<Long>>()
   private val activeConnectionsByPeer = ConcurrentHashMap<PeerId, AtomicInteger>()
   private val activeGlobalConnections = AtomicInteger(0)
+  private var listenerJob: Job? = null
 
   private val _destinationsFlow = MutableStateFlow<List<LanDestination>>(emptyList())
   val destinationsFlow: StateFlow<List<LanDestination>> = _destinationsFlow.asStateFlow()
@@ -72,6 +77,55 @@ class LanProxy(
 
   fun currentPeerActiveConnections(peerId: PeerId): Int =
     activeConnectionsByPeer[peerId]?.get() ?: 0
+
+  fun start(scope: CoroutineScope, transport: Transport) {
+    listenerJob?.cancel()
+    listenerJob = scope.launch(ioDispatcher) {
+      transport.listen(LAN_PROXY_PORT).collect { stream ->
+        launch {
+          handleIncomingProxyStream(stream)
+        }
+      }
+    }
+  }
+
+  fun stop() {
+    listenerJob?.cancel()
+    listenerJob = null
+  }
+
+  private suspend fun handleIncomingProxyStream(stream: TransportStream) {
+    val firstFrame = stream.readFrameBytes(128)
+    if (firstFrame is TransportResult.Failure) {
+      stream.close()
+      return
+    }
+    val destBytes = (firstFrame as TransportResult.Success).value
+    if (destBytes == null || destBytes.isEmpty()) {
+      stream.close()
+      return
+    }
+    val destIdRaw = runCatching { String(destBytes, Charsets.UTF_8).trim() }.getOrNull()
+    val destId = destIdRaw?.let { runCatching { DestinationId(it) }.getOrNull() }
+    if (destId == null) {
+      stream.close()
+      return
+    }
+    val peerId = PeerId.parse(stream.remotePeer.base64Url)
+    if (peerId == null) {
+      stream.close()
+      return
+    }
+    forwardTcpConnection(peerId, destId, stream)
+  }
+
+  fun restoreDestinations(persisted: Collection<LanDestination>) {
+    destinations.clear()
+    for (dest in persisted) {
+      destinations[dest.id] = dest
+    }
+    _destinationsFlow.value = destinations.values.sortedBy { it.label }
+  }
 
   fun addAllowlistedDestination(
     id: DestinationId,
@@ -279,6 +333,7 @@ class LanProxy(
   }
 
   companion object {
+    const val LAN_PROXY_PORT = 7002
     const val MAX_PROXY_CHUNK_BYTES = 16 * 1024
   }
 }

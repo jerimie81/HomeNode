@@ -78,13 +78,13 @@ class MountManager(
         is SafFileBackend -> if (backend.isSimulatedAdapter) {
           warnings.add("Mount '/${mount.id.value}' (${mount.label}): FakeSafTreeAdapter active (not real DocumentsContract)")
         }
-        is SmbFileBackend -> {
+        is SmbFileBackend -> if (backend.isWireStubbed) {
           warnings.add("Mount '/${mount.id.value}' (${mount.label}): FakeSmbSessionAdapter active (smbj wire adapter stubbed)")
         }
-        is WebDavFileBackend -> {
+        is WebDavFileBackend -> if (backend.isWireStubbed) {
           warnings.add("Mount '/${mount.id.value}' (${mount.label}): WebDAV wire adapter stubbed")
         }
-        is SftpFileBackend -> {
+        is SftpFileBackend -> if (backend.isWireStubbed) {
           warnings.add("Mount '/${mount.id.value}' (${mount.label}): SFTP wire adapter stubbed")
         }
         is CloudIdTreeBackend -> if (backend.isRestWireStubbed) {
@@ -93,6 +93,26 @@ class MountManager(
       }
     }
     return warnings.sorted()
+  }
+
+  fun restorePersistedMounts(persistedMounts: Collection<StorageMount>) {
+    mountsById.clear()
+    backendsById.clear()
+    for (mount in persistedMounts) {
+      val backend = runCatching {
+        buildBackendForMount(mount.id, mount.provider, mount.config, mount.credentialRef, mount.readOnly)
+      }.getOrNull() ?: continue
+      val effectiveState = if (backend is SafFileBackend &&
+        (mount.state is MountState.Ready || mount.state is MountState.NeedsReauth || mount.state is MountState.Unavailable)
+      ) {
+        backend.evaluateMountState()
+      } else {
+        mount.state
+      }
+      mountsById[mount.id] = mount.copy(state = effectiveState)
+      backendsById[mount.id] = backend
+    }
+    publishMounts()
   }
 
   suspend fun addMount(
@@ -325,7 +345,7 @@ class MountManager(
       is MountConfig.CloudConfig -> CloudIdTreeBackend(
         provider = provider,
         accountVaultKey = credKey ?: VaultKey("mount.${mountId.value}.secret"),
-        publicClientId = "homenode-public-client",
+        publicClientId = config.publicClientId,
         rootFolderId = config.rootFolderId,
         authCoordinator = cloudAuth,
         isReadOnly = readOnly,

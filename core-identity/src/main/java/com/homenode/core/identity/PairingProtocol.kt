@@ -188,6 +188,7 @@ class ModeAPairingCoordinator(
       label = userConfirmedLabel,
       capabilities = userSelectedCapabilities,
       expiresAtEpochMillis = peerExpiryEpochMillis,
+      endpointHints = payload.endpointHints,
     )
     return PairingResult.Success(record)
   }

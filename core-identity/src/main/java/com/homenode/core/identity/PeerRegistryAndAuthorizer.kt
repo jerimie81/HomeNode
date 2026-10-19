@@ -14,6 +14,7 @@ data class PeerRecord(
   val capabilities: Set<Capability>,
   val expiresAtEpochMillis: Long? = null,
   val revoked: Boolean = false,
+  val endpointHints: List<String> = emptyList(),
 ) {
   val tunnelCidr32: String get() = "$tunnelIp/32"
 }
@@ -43,6 +44,20 @@ class TunnelAddressAllocator {
   }
 
   @Synchronized
+  fun restoreAllocation(peerId: PeerId, tunnelIp: String): String {
+    val existingOwner = peerByIp[tunnelIp]
+    if (existingOwner != null && existingOwner != peerId) {
+      return allocateForPeer(peerId)
+    }
+    val previousIp = assignedByPeer.put(peerId, tunnelIp)
+    if (previousIp != null && previousIp != tunnelIp) {
+      peerByIp.remove(previousIp, peerId)
+    }
+    peerByIp[tunnelIp] = peerId
+    return tunnelIp
+  }
+
+  @Synchronized
   fun release(peerId: PeerId) {
     val ip = assignedByPeer.remove(peerId)
     if (ip != null) {
@@ -69,10 +84,16 @@ class PeerAuthorizer(
     label: String,
     capabilities: Set<Capability>,
     expiresAtEpochMillis: Long? = null,
+    endpointHints: List<String> = emptyList(),
+    preferredTunnelIp: String? = null,
   ): PeerRecord {
     val sanitizedLabel = label.filter { !it.isISOControl() }.trim().take(48).ifEmpty { "Peer ${peerId.shortId}" }
     val normalizedCaps = normalizeCapabilities(capabilities)
-    val ip = ipAllocator.allocateForPeer(peerId)
+    val ip = if (preferredTunnelIp != null) {
+      ipAllocator.restoreAllocation(peerId, preferredTunnelIp)
+    } else {
+      ipAllocator.allocateForPeer(peerId)
+    }
     val record = PeerRecord(
       peerId = peerId,
       label = sanitizedLabel,
@@ -80,9 +101,34 @@ class PeerAuthorizer(
       capabilities = normalizedCaps,
       expiresAtEpochMillis = expiresAtEpochMillis,
       revoked = false,
+      endpointHints = endpointHints,
     )
     peers[peerId] = record
     return record
+  }
+
+  @Synchronized
+  fun restorePersistedPeers(records: Collection<PeerRecord>) {
+    for (record in records) {
+      val sanitizedLabel = record.label.filter { !it.isISOControl() }.trim().take(48)
+        .ifEmpty { "Peer ${record.peerId.shortId}" }
+      if (record.revoked) {
+        ipAllocator.release(record.peerId)
+        peers[record.peerId] = record.copy(
+          label = sanitizedLabel,
+          capabilities = emptySet(),
+          revoked = true,
+        )
+      } else {
+        val allocatedIp = ipAllocator.restoreAllocation(record.peerId, record.tunnelIp)
+        peers[record.peerId] = record.copy(
+          label = sanitizedLabel,
+          tunnelIp = allocatedIp,
+          capabilities = normalizeCapabilities(record.capabilities),
+          revoked = false,
+        )
+      }
+    }
   }
 
   fun grantCapability(peerId: PeerId, capability: Capability): PeerRecord? {
